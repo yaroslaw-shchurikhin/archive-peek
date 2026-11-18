@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
 import { ArchiveManager } from './archiveManager';
+import { archiveBaseName, describeArchiveId } from './archiveId';
+import { Logger, NULL_LOGGER } from './models';
+import { archiveIdFromUri, uriFromArchiveId } from './vscodeFileAccess';
 
 /** Setting that enables/disables automatic refresh of changed archives. */
 export const AUTO_REFRESH_SETTING = 'archivePeek.autoRefresh';
@@ -13,7 +14,13 @@ const DEBOUNCE_MS = 300;
  * Watches opened archives on disk and asks the ArchiveManager to re-read
  * them when they change, or to forget them when they are deleted.
  *
- * Each archive gets its own watcher scoped to that single file. Watching
+ * Each archive gets its own watcher scoped to that single file. Remote
+ * archives are watched through the same API: VS Code forwards the watch
+ * request to the FileSystemProvider that owns the URI (for Remote SSH, the
+ * VS Code Server's file watcher), so no polling or extra SSH session is
+ * needed. Providers that don't support watching simply never fire; the
+ * archive is still re-checked when its editor becomes active again, when an
+ * entry is opened, and on a manual refresh. Watching
  * continues after a deletion so an archive that is rebuilt later (e.g.
  * `make clean && make`) is picked up again; it stops when the archive is
  * explicitly closed.
@@ -24,7 +31,10 @@ export class ArchiveWatcher implements vscode.Disposable {
   private disposables: vscode.Disposable[] = [];
   private enabled: boolean;
 
-  constructor(private readonly archiveManager: ArchiveManager) {
+  constructor(
+    private readonly archiveManager: ArchiveManager,
+    private readonly logger: Logger = NULL_LOGGER
+  ) {
     this.enabled = ArchiveWatcher.isEnabled();
 
     this.disposables.push(
@@ -72,13 +82,22 @@ export class ArchiveWatcher implements vscode.Disposable {
       return;
     }
 
-    const pattern = new vscode.RelativePattern(
-      vscode.Uri.file(path.dirname(filePath)),
-      escapeGlob(path.basename(filePath))
-    );
-    const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    const archiveUri = uriFromArchiveId(filePath);
+    // Parent folder with the original scheme and authority (works for file: and vscode-remote: alike)
+    const parentUri = vscode.Uri.joinPath(archiveUri, '..');
+    const pattern = new vscode.RelativePattern(parentUri, escapeGlob(archiveBaseName(filePath)));
+    let watcher: vscode.FileSystemWatcher;
+    try {
+      watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    } catch (error: any) {
+      this.logger.warn(
+        `File watching is not available for ${describeArchiveId(filePath, { redactHost: true })}: ${error.message}`
+      );
+      return;
+    }
     const onEvent = (uri: vscode.Uri) => {
-      if (path.resolve(uri.fsPath) === filePath) {
+      if (archiveIdFromUri(uri) === filePath) {
+        this.logger.trace(`Change event for ${describeArchiveId(filePath, { redactHost: true })}`);
         this.schedule(filePath);
       }
     };
@@ -119,21 +138,35 @@ export class ArchiveWatcher implements vscode.Disposable {
    * temp-file-and-rename writes, which arrive as delete + create.
    */
   private async sync(filePath: string): Promise<void> {
-    const exists = await fs.promises.stat(filePath).then(
-      () => true,
-      () => false
-    );
+    const state = await this.archiveManager.probe(filePath);
+    const label = describeArchiveId(filePath, { redactHost: true });
 
-    if (!exists) {
+    if (state === 'missing') {
+      this.logger.info(`Archive was deleted or moved: ${label}`);
       this.archiveManager.markDeleted(filePath);
+      return;
+    }
+    if (state === 'unavailable') {
+      // Connection lost: keep showing the last known contents
+      this.logger.warn(`Remote host unavailable while checking ${label}; keeping the last known contents`);
       return;
     }
 
     try {
-      await this.archiveManager.refreshIfChanged(filePath);
-    } catch (_error) {
+      if (await this.archiveManager.refreshIfChanged(filePath)) {
+        this.logger.info(`Archive changed on disk and was reloaded: ${label}`);
+      }
+    } catch (error: any) {
       // Most likely the archive is still being written. The previous
       // contents are kept, and the next change event will retry.
+      this.logger.warn(`Could not reload changed archive ${label}: ${error.message}`);
+    }
+  }
+
+  /** Re-check one archive now (e.g. when its editor becomes visible again). */
+  check(filePath: string): void {
+    if (this.enabled) {
+      this.schedule(filePath);
     }
   }
 

@@ -1,7 +1,26 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { ArchiveManager, OpenArchive } from './archiveManager';
 import { archiveEntryUri } from './archiveFileSystemProvider';
+import { archiveBaseName, archivePathPart, describeArchiveId, isRemoteId, remoteLabel } from './archiveId';
+import { formatBytes, Logger, NULL_LOGGER } from './models';
+import { describeError } from './sourceErrors';
+import { archiveIdFromUri } from './vscodeFileAccess';
+
+/** A loading or error state shown instead of the archive contents. */
+interface ViewStatus {
+  kind: 'loading' | 'error';
+  message: string;
+  actions?: { command: string; label: string }[];
+}
+
+/** Hooks the editor needs from the rest of the extension. */
+export interface ArchiveEditorHooks {
+  logger?: Logger;
+  /** Show the Archive Peek output channel */
+  showLog?: () => void;
+  /** Called when an archive editor becomes active again (cheap change check) */
+  onDidActivate?: (archiveId: string) => void;
+}
 
 /**
  * Tree node structure passed to the webview as JSON.
@@ -24,7 +43,14 @@ interface TreeNode {
 export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvider {
   public static readonly viewType = 'archivePeek.archiveEditor';
 
-  constructor(private readonly archiveManager: ArchiveManager) {}
+  private readonly logger: Logger;
+
+  constructor(
+    private readonly archiveManager: ArchiveManager,
+    private readonly hooks: ArchiveEditorHooks = {}
+  ) {
+    this.logger = hooks.logger ?? NULL_LOGGER;
+  }
 
   async openCustomDocument(
     uri: vscode.Uri,
@@ -39,47 +65,136 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
     webviewPanel: vscode.WebviewPanel,
     _token: vscode.CancellationToken
   ): Promise<void> {
-    const archivePath = document.uri.fsPath;
-    const fileName = path.basename(archivePath);
-
-    let archive: OpenArchive | undefined;
-    try {
-      archive = await this.archiveManager.openArchive(archivePath);
-    } catch (error: any) {
-      vscode.window.showErrorMessage(`Failed to open archive: ${error.message}`);
-    }
+    // Keep the URI's scheme and authority: in a Remote SSH window this is a
+    // vscode-remote:// URI that must not be turned into a local path.
+    const archivePath = archiveIdFromUri(document.uri);
+    const fileName = archiveBaseName(archivePath);
+    const remote = isRemoteId(archivePath);
 
     webviewPanel.webview.options = { enableScripts: true };
-    this.render(webviewPanel, fileName, archivePath, archive);
+    let disposed = false;
+
+    const load = async () => {
+      this.render(webviewPanel, fileName, archivePath, undefined, undefined, {
+        kind: 'loading',
+        message: remote ? 'Loading archive from the remote host…' : 'Loading archive…'
+      });
+      try {
+        const archive = await this.openWithProgress(archivePath, fileName);
+        if (!disposed) {
+          this.render(webviewPanel, fileName, archivePath, archive);
+        }
+      } catch (error) {
+        const { kind, message } = describeError(error);
+        this.logger.error(
+          `Failed to open ${describeArchiveId(archivePath, { redactHost: true })} [${kind}]: ${message}`
+        );
+        if (disposed) {
+          return;
+        }
+        const actions = [{ command: 'retry', label: 'Retry' }];
+        if (kind === 'too-large') {
+          actions.unshift({ command: 'loadAnyway', label: 'Load Anyway' });
+          actions.push({ command: 'openSettings', label: 'Settings' });
+        } else if (kind === 'too-many-entries') {
+          actions.push({ command: 'openSettings', label: 'Settings' });
+        }
+        actions.push({ command: 'showLog', label: 'Show Log' });
+        this.render(webviewPanel, fileName, archivePath, undefined, undefined, { kind: 'error', message, actions });
+      }
+    };
 
     // Re-render when the archive changes or disappears on disk
-    const absPath = path.resolve(archivePath);
     const subscription = this.archiveManager.onDidChangeArchive((event) => {
-      if (event.filePath !== absPath) {
+      if (event.filePath !== archivePath) {
         return;
       }
       if (event.type === 'changed') {
         this.render(webviewPanel, fileName, archivePath, event.archive);
       } else if (event.type === 'deleted') {
-        this.render(webviewPanel, fileName, archivePath, undefined, 'This archive was deleted from disk.');
+        this.render(webviewPanel, fileName, archivePath, undefined, undefined, {
+          kind: 'error',
+          message: 'This archive was deleted from disk.',
+          actions: [{ command: 'retry', label: 'Retry' }]
+        });
       }
     });
-    webviewPanel.onDidDispose(() => subscription.dispose());
+    const viewState = webviewPanel.onDidChangeViewState(() => {
+      if (webviewPanel.active && this.archiveManager.getArchive(archivePath)) {
+        this.hooks.onDidActivate?.(archivePath);
+      }
+    });
+    webviewPanel.onDidDispose(() => {
+      disposed = true;
+      subscription.dispose();
+      viewState.dispose();
+    });
 
-    // Handle messages from the webview (file open requests)
+    // Handle messages from the webview
     webviewPanel.webview.onDidReceiveMessage(async (message) => {
-      if (message.command === 'openFile') {
-        try {
-          const uri = archiveEntryUri(archivePath, message.entryPath);
-          const doc = await vscode.workspace.openTextDocument(uri);
-          await vscode.window.showTextDocument(doc, {
-            preview: true
-          });
-        } catch (error: any) {
-          vscode.window.showErrorMessage(`Failed to open file: ${error.message}`);
-        }
+      switch (message.command) {
+        case 'openFile':
+          await this.openEntry(archivePath, message.entryPath);
+          break;
+        case 'retry':
+          await load();
+          break;
+        case 'loadAnyway':
+          this.archiveManager.allowOversize(archivePath);
+          await load();
+          break;
+        case 'openSettings':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'archivePeek');
+          break;
+        case 'showLog':
+          this.hooks.showLog?.();
+          break;
       }
     }, undefined);
+
+    await load();
+  }
+
+  /** Open (or reuse) the archive, with a progress indicator for remote and large archives. */
+  private openWithProgress(archivePath: string, fileName: string): Promise<OpenArchive> {
+    const existing = this.archiveManager.getArchive(archivePath);
+    if (existing) {
+      return Promise.resolve(existing);
+    }
+    const remote = isRemoteId(archivePath);
+    return Promise.resolve(
+      vscode.window.withProgress(
+        {
+          // Remote transfers can take a while: show a notification. Local archives only get a status bar spinner.
+          location: remote ? vscode.ProgressLocation.Notification : vscode.ProgressLocation.Window,
+          title: `Archive Peek: ${fileName}`,
+          cancellable: false
+        },
+        (progress) =>
+          this.archiveManager.openArchive(archivePath, {
+            onProgress: (message) => progress.report({ message })
+          })
+      )
+    );
+  }
+
+  /** Open one entry of the archive as a read-only text document. */
+  private async openEntry(archivePath: string, entryPath: string): Promise<void> {
+    try {
+      const uri = archiveEntryUri(archivePath, entryPath);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(doc, {
+        preview: true
+      });
+    } catch (error: any) {
+      this.logger.error(
+        `Failed to open "${entryPath}" from ${describeArchiveId(archivePath, { redactHost: true })}: ${error.message}`
+      );
+      const choice = await vscode.window.showErrorMessage(`Failed to open file: ${error.message}`, 'Show Log');
+      if (choice === 'Show Log') {
+        this.hooks.showLog?.();
+      }
+    }
   }
 
   private render(
@@ -87,8 +202,12 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
     fileName: string,
     archivePath: string,
     archive: OpenArchive | undefined,
-    notice?: string
+    notice?: string,
+    status?: ViewStatus
   ): void {
+    if (archive && archive.entries.length === 0 && !notice) {
+      notice = 'This archive is empty.';
+    }
     const fileCount = archive ? archive.entries.filter((e) => !e.isDirectory).length : 0;
     const dirCount = archive ? archive.entries.filter((e) => e.isDirectory).length : 0;
     const archiveType = archive ? archive.type.toUpperCase() : 'Unknown';
@@ -99,13 +218,14 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
 
     webviewPanel.webview.html = this.getWebviewHtml(
       fileName,
-      archivePath,
+      displayLocation(archivePath),
       archiveType,
       fileCount,
       dirCount,
       totalSize,
       tree,
-      notice
+      notice,
+      status
     );
   }
 
@@ -214,9 +334,27 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
     dirCount: number,
     totalSize: number,
     tree: TreeNode[],
-    notice?: string
+    notice?: string,
+    status?: ViewStatus
   ): string {
-    const treeJson = JSON.stringify(tree);
+    // Entry names come from the archive: escape "<" so a name like
+    // "</script>" can't break out of the inline script.
+    const treeJson = JSON.stringify(tree).replace(/</g, '\\u003c');
+    const statusHtml = status
+      ? `
+  <div class="notice ${status.kind}">
+    <div>${escapeHtml(status.message)}</div>${
+      status.actions && status.actions.length > 0
+        ? `
+    <div class="actions">${status.actions
+      .map((a) => `<button data-command="${escapeHtml(a.command)}">${escapeHtml(a.label)}</button>`)
+      .join('')}</div>`
+        : ''
+    }
+  </div>
+`
+      : '';
+    const showContents = !status;
 
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -260,6 +398,32 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
       padding: 8px 12px;
       margin-bottom: 20px;
       border-radius: 4px;
+    }
+    .notice.error {
+      background: var(--vscode-inputValidation-errorBackground);
+      border-color: var(--vscode-inputValidation-errorBorder);
+    }
+    .notice.loading {
+      background: var(--vscode-editorWidget-background);
+      border-color: var(--vscode-editorWidget-border, var(--vscode-widget-border, transparent));
+    }
+    .notice .actions {
+      margin-top: 8px;
+      display: flex;
+      gap: 8px;
+    }
+    .notice button {
+      background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+      color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+      border: none;
+      padding: 4px 10px;
+      border-radius: 2px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: inherit;
+    }
+    .notice button:hover {
+      background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
     }
 
     /* ── Stats ── */
@@ -373,7 +537,9 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
       <div class="subtitle">${escapeHtml(filePath)}</div>
     </div>
   </div>
-${notice ? `\n  <div class="notice">${escapeHtml(notice)}</div>\n` : ''}
+${notice ? `\n  <div class="notice">${escapeHtml(notice)}</div>\n` : ''}${statusHtml}${
+      showContents
+        ? `
   <div class="stats">
     <div class="stat-card">
       <div class="stat-label">Format</div>
@@ -395,6 +561,9 @@ ${notice ? `\n  <div class="notice">${escapeHtml(notice)}</div>\n` : ''}
 
   <div class="tree-header">Contents</div>
   <div class="tree" id="fileTree"></div>
+`
+        : ''
+    }
 
   <script>
     const vscode = acquireVsCodeApi();
@@ -495,7 +664,12 @@ ${notice ? `\n  <div class="notice">${escapeHtml(notice)}</div>\n` : ''}
     }
 
     const container = document.getElementById('fileTree');
-    container.appendChild(buildTreeHtml(treeData, true));
+    if (container) {
+      container.appendChild(buildTreeHtml(treeData, true));
+    }
+    for (const button of document.querySelectorAll('button[data-command]')) {
+      button.addEventListener('click', () => vscode.postMessage({ command: button.dataset.command }));
+    }
   </script>
 </body>
 </html>`;
@@ -507,11 +681,11 @@ function escapeHtml(text: string): string {
 }
 
 function formatSize(bytes: number): string {
-  if (bytes === 0) {
-    return '0 B';
-  }
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const size = (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1);
-  return `${size} ${units[i]}`;
+  return formatBytes(bytes);
+}
+
+/** Subtitle: the local path, or "[SSH: host] /remote/path" for remote archives. */
+function displayLocation(archivePath: string): string {
+  const label = remoteLabel(archivePath);
+  return label ? `[${label}] ${archivePathPart(archivePath)}` : archivePath;
 }

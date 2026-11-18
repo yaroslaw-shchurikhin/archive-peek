@@ -12,7 +12,9 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, 'src')
+      '@': path.resolve(__dirname, 'src'),
+      // Unit tests run outside VS Code: use a minimal stand-in for the vscode API
+      vscode: path.resolve(__dirname, 'test/mocks/vscode.ts')
     }
   }
 });

@@ -1,13 +1,17 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { ArchiveChangeEvent, ArchiveManager } from './archiveManager';
+import { archiveBaseName, describeArchiveId, normalizeArchiveId } from './archiveId';
+import { EntryTooLargeError, Logger, NULL_LOGGER } from './models';
+import { describeError } from './sourceErrors';
 
 /**
  * URI scheme for archive virtual filesystem.
  *
- * URI format: archive://<hex-encoded-archive-path>/<archive-filename>/<entry-path>
+ * URI format: archive://<hex-encoded-archive-id>/<archive-filename>/<entry-path>
  *
- * The archive's absolute disk path is hex-encoded into the URI authority,
+ * The archive id — the absolute disk path of a local archive, or the full
+ * URI (scheme, authority and path) of a remote one such as
+ * `vscode-remote://ssh-remote+host/srv/build.tar.gz` — is hex-encoded into the URI authority,
  * and the path contains the human-readable archive filename followed by
  * the entry path. This makes VS Code display clean tab titles like
  * "myarchive.zip/src/index.ts" instead of hex gibberish.
@@ -25,9 +29,9 @@ export const ARCHIVE_SCHEME = 'archive';
  * Build a URI for the root of an archive.
  */
 export function archiveRootUri(archivePath: string): vscode.Uri {
-  const resolved = path.resolve(archivePath);
+  const resolved = normalizeArchiveId(archivePath);
   const encoded = Buffer.from(resolved).toString('hex');
-  const archiveName = path.basename(resolved);
+  const archiveName = archiveBaseName(resolved);
   return vscode.Uri.from({ scheme: ARCHIVE_SCHEME, authority: encoded, path: `/${archiveName}` });
 }
 
@@ -35,9 +39,9 @@ export function archiveRootUri(archivePath: string): vscode.Uri {
  * Build a URI for a specific entry inside an archive.
  */
 export function archiveEntryUri(archivePath: string, entryPath: string): vscode.Uri {
-  const resolved = path.resolve(archivePath);
+  const resolved = normalizeArchiveId(archivePath);
   const encoded = Buffer.from(resolved).toString('hex');
-  const archiveName = path.basename(resolved);
+  const archiveName = archiveBaseName(resolved);
   return vscode.Uri.from({
     scheme: ARCHIVE_SCHEME,
     authority: encoded,
@@ -70,7 +74,10 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
   readonly onDidChangeFile = this._onDidChangeFile.event;
   private subscription: { dispose(): void };
 
-  constructor(private archiveManager: ArchiveManager) {
+  constructor(
+    private archiveManager: ArchiveManager,
+    private readonly logger: Logger = NULL_LOGGER
+  ) {
     this.subscription = archiveManager.onDidChangeArchive((event) => this.onArchiveChanged(event));
   }
 
@@ -115,7 +122,8 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
     // Ensure archive is loaded
     try {
       await this.archiveManager.openArchive(archivePath);
-    } catch (_error) {
+    } catch (error) {
+      this.logFailure('stat', archivePath, entryPath, error);
       throw vscode.FileSystemError.FileNotFound(uri);
     }
     const archive = this.archiveManager.getArchive(archivePath);
@@ -183,7 +191,8 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
 
     try {
       await this.archiveManager.openArchive(archivePath);
-    } catch (_error) {
+    } catch (error) {
+      this.logFailure('list', archivePath, entryPath, error);
       throw vscode.FileSystemError.FileNotFound(uri);
     }
     const archive = this.archiveManager.getArchive(archivePath);
@@ -217,9 +226,27 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
     try {
       const buffer = await this.archiveManager.readEntry(archivePath, entryPath);
       return new Uint8Array(buffer);
-    } catch (_error: any) {
+    } catch (error: any) {
+      this.logFailure('read', archivePath, entryPath, error);
+      if (error instanceof EntryTooLargeError) {
+        throw vscode.FileSystemError.NoPermissions(error.message);
+      }
+      const { kind, message } = describeError(error);
+      if (kind === 'unavailable') {
+        throw vscode.FileSystemError.Unavailable(message);
+      }
+      if (kind === 'no-permission') {
+        throw vscode.FileSystemError.NoPermissions(message);
+      }
       throw vscode.FileSystemError.FileNotFound(uri);
     }
+  }
+
+  private logFailure(action: string, archivePath: string, entryPath: string, error: unknown): void {
+    const { kind, message } = describeError(error);
+    this.logger.error(
+      `Failed to ${action} ${entryPath ? `"${entryPath}" in ` : ''}${describeArchiveId(archivePath, { redactHost: true })} [${kind}]: ${message}`
+    );
   }
 
   // ─── Read-only: all write operations throw ──────────────────────────

@@ -1,7 +1,7 @@
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { ArchiveEntry, IArchiveHandler } from '../models';
+import { ArchiveEntry, IArchiveHandler, ListOptions, TooManyEntriesError } from '../models';
 import { list as sevenList } from 'node-7z';
 import sevenBin = require('7zip-bin');
 import { execFile } from 'child_process';
@@ -22,8 +22,10 @@ export class SevenZipHandler implements IArchiveHandler {
     return filePath.toLowerCase().endsWith('.7z');
   }
 
-  async listEntries(archivePath: string): Promise<ArchiveEntry[]> {
+  async listEntries(archivePath: string, options?: ListOptions): Promise<ArchiveEntry[]> {
+    const maxEntries = options?.maxEntries ?? Infinity;
     return new Promise<ArchiveEntry[]>((resolve, reject) => {
+      let settled = false;
       const entries: ArchiveEntry[] = [];
       const seenDirs = new Set<string>();
 
@@ -64,10 +66,26 @@ export class SevenZipHandler implements IArchiveHandler {
             });
           }
         }
+
+        if (!settled && entries.length > maxEntries) {
+          settled = true;
+          listStream.destroy();
+          reject(new TooManyEntriesError(maxEntries));
+        }
       });
 
-      listStream.on('end', () => resolve(entries));
-      listStream.on('error', (err: Error) => reject(err));
+      listStream.on('end', () => {
+        if (!settled) {
+          settled = true;
+          resolve(entries);
+        }
+      });
+      listStream.on('error', (err: Error) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      });
     });
   }
 

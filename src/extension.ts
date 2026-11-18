@@ -1,20 +1,43 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { ArchiveManager } from './archiveManager';
 import { ArchiveFileSystemProvider, ARCHIVE_SCHEME } from './archiveFileSystemProvider';
 import { ArchiveEditorProvider } from './archiveEditorProvider';
 import { ArchiveWatcher } from './archiveWatcher';
+import { archiveBaseName, archivePathPart, describeArchiveId, isRemoteId, remoteLabel } from './archiveId';
+import { OutputChannelLogger } from './logger';
+import { RemoteArchiveCache } from './remoteArchiveCache';
+import { archiveLimits, maxRemoteArchiveBytes, maxRemoteCacheBytes } from './config';
+import { describeError } from './sourceErrors';
+import { archiveIdFromUri, VscodeRemoteFileAccess } from './vscodeFileAccess';
 
 let archiveManager: ArchiveManager;
 let fsProvider: ArchiveFileSystemProvider;
+let remoteCache: RemoteArchiveCache | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-  archiveManager = new ArchiveManager();
-  fsProvider = new ArchiveFileSystemProvider(archiveManager);
+  const logger = new OutputChannelLogger();
+  context.subscriptions.push(logger);
+  logEnvironment(context, logger);
+
+  // Remote archives (any non-file: URI, e.g. vscode-remote://ssh-remote+host/…) are
+  // read through vscode.workspace.fs over the existing VS Code connection and
+  // processed locally; see remoteArchiveCache.ts.
+  remoteCache = new RemoteArchiveCache(new VscodeRemoteFileAccess(), {
+    maxArchiveBytes: maxRemoteArchiveBytes,
+    maxCacheBytes: maxRemoteCacheBytes,
+    logger
+  });
+  const cache = remoteCache;
+  context.subscriptions.push({ dispose: () => cache.dispose() });
+  void RemoteArchiveCache.cleanupStale(undefined, logger);
+
+  archiveManager = new ArchiveManager({ remote: remoteCache, logger, limits: archiveLimits });
+  fsProvider = new ArchiveFileSystemProvider(archiveManager, logger);
   context.subscriptions.push(fsProvider);
 
   // Automatically refresh opened archives when they change on disk
-  context.subscriptions.push(new ArchiveWatcher(archiveManager));
+  const watcher = new ArchiveWatcher(archiveManager, logger);
+  context.subscriptions.push(watcher);
 
   // Register the virtual filesystem for the archive:/ scheme
   context.subscriptions.push(
@@ -25,7 +48,16 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // Register the custom editor — clicking an archive opens stats + embedded file tree
-  const editorProvider = new ArchiveEditorProvider(archiveManager);
+  const editorProvider = new ArchiveEditorProvider(archiveManager, {
+    logger,
+    showLog: () => logger.show(),
+    onDidActivate: (archiveId) => {
+      // Cheap re-check for remote archives, in case the provider doesn't deliver watch events
+      if (isRemoteId(archiveId)) {
+        watcher.check(archiveId);
+      }
+    }
+  });
   context.subscriptions.push(
     vscode.window.registerCustomEditorProvider(ArchiveEditorProvider.viewType, editorProvider, {
       webviewOptions: { retainContextWhenHidden: false },
@@ -36,10 +68,10 @@ export function activate(context: vscode.ExtensionContext) {
   // ─── Command: Open Archive ───────────────────────────────────────────
   context.subscriptions.push(
     vscode.commands.registerCommand('archivePeek.openArchive', async (uri?: vscode.Uri) => {
-      let archivePath: string;
+      let archiveUri: vscode.Uri;
 
       if (uri) {
-        archivePath = uri.fsPath;
+        archiveUri = uri;
       } else {
         const result = await vscode.window.showOpenDialog({
           canSelectFiles: true,
@@ -86,33 +118,22 @@ export function activate(context: vscode.ExtensionContext) {
         if (!result || result.length === 0) {
           return;
         }
-        archivePath = result[0].fsPath;
+        archiveUri = result[0];
       }
 
+      // Keep scheme + authority (vscode-remote://…); never use fsPath for remote resources
+      const archivePath = archiveIdFromUri(archiveUri);
+      const fileName = archiveBaseName(archivePath);
       if (!archiveManager.isSupported(archivePath)) {
-        vscode.window.showErrorMessage(`Unsupported archive format: ${path.basename(archivePath)}`);
+        vscode.window.showErrorMessage(`Unsupported archive format: ${fileName}`);
         return;
       }
 
+      // The custom editor loads the archive (with progress and error reporting)
       try {
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Opening archive: ${path.basename(archivePath)}`,
-            cancellable: false
-          },
-          async () => {
-            await archiveManager.openArchive(archivePath);
-          }
-        );
-
-        // Open the archive in the custom editor
-        await vscode.commands.executeCommand(
-          'vscode.openWith',
-          uri ?? vscode.Uri.file(archivePath),
-          ArchiveEditorProvider.viewType
-        );
+        await vscode.commands.executeCommand('vscode.openWith', archiveUri, ArchiveEditorProvider.viewType);
       } catch (error: any) {
+        logger.error(`Failed to open ${describeArchiveId(archivePath, { redactHost: true })}: ${error.message}`);
         vscode.window.showErrorMessage(`Failed to open archive: ${error.message}`);
       }
     })
@@ -122,13 +143,32 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('archivePeek.refresh', async () => {
       const archives = archiveManager.getOpenArchives();
-      for (const archive of archives) {
-        try {
-          await archiveManager.refreshArchive(archive.filePath);
-        } catch (error: any) {
-          vscode.window.showWarningMessage(`Failed to refresh ${path.basename(archive.filePath)}: ${error.message}`);
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: 'Archive Peek: refreshing archives' },
+        async (progress) => {
+          for (const archive of archives) {
+            const name = archiveBaseName(archive.filePath);
+            progress.report({ message: name });
+            try {
+              const state = await archiveManager.probe(archive.filePath);
+              if (state === 'missing') {
+                archiveManager.markDeleted(archive.filePath);
+                continue;
+              }
+              await archiveManager.refreshArchive(archive.filePath, {
+                onProgress: (message) => progress.report({ message: `${name}: ${message}` })
+              });
+              logger.info(`Refreshed ${describeArchiveId(archive.filePath, { redactHost: true })}`);
+            } catch (error) {
+              const { kind, message } = describeError(error);
+              logger.warn(
+                `Failed to refresh ${describeArchiveId(archive.filePath, { redactHost: true })} [${kind}]: ${message}`
+              );
+              vscode.window.showWarningMessage(`Failed to refresh ${name}: ${message}`);
+            }
+          }
         }
-      }
+      );
     })
   );
 
@@ -143,8 +183,10 @@ export function activate(context: vscode.ExtensionContext) {
 
       const picked = await vscode.window.showQuickPick(
         archives.map((a) => ({
-          label: path.basename(a.filePath),
-          description: a.filePath,
+          label: archiveBaseName(a.filePath),
+          description: remoteLabel(a.filePath)
+            ? `[${remoteLabel(a.filePath)}] ${archivePathPart(a.filePath)}`
+            : a.filePath,
           archivePath: a.filePath
         })),
         { placeHolder: 'Select an archive to close' }
@@ -159,5 +201,25 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  // Nothing to clean up
+  // Delete local copies of remote archives (also done via context.subscriptions)
+  remoteCache?.dispose();
+}
+
+/** Log where the extension runs, so Remote SSH problems can be diagnosed from the Output channel. */
+function logEnvironment(context: vscode.ExtensionContext, logger: OutputChannelLogger): void {
+  const kind =
+    context.extension.extensionKind === vscode.ExtensionKind.UI
+      ? 'local (UI extension host)'
+      : 'remote (workspace extension host)';
+  logger.info(
+    `Archive Peek ${context.extension.packageJSON.version} activated in the ${kind}; ` +
+      `remote window: ${vscode.env.remoteName ?? 'none'}; UI: ${vscode.env.uiKind === vscode.UIKind.Web ? 'web' : 'desktop'}; ` +
+      `platform: ${process.platform}`
+  );
+  if (vscode.env.remoteName && context.extension.extensionKind !== vscode.ExtensionKind.UI) {
+    logger.warn(
+      'Archive Peek is running on the remote host. It is designed to run locally (extensionKind "ui"); ' +
+        'check the "remote.extensionKind" setting.'
+    );
+  }
 }

@@ -1,8 +1,16 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { ArchiveEntry, IArchiveHandler } from '../models';
+import { DecompressStreamFactory, innerName, listSingleFile, readSingleFile } from './singleFileCommon';
 
 const bz2 = require('unbzip2-stream');
+
+const EXTENSION = /\.bz2$/i;
+
+const createStream: DecompressStreamFactory = (archivePath) => {
+  const fileStream = fs.createReadStream(archivePath);
+  const decompressor = bz2();
+  return { output: fileStream.pipe(decompressor), streams: [fileStream, decompressor] };
+};
 
 /**
  * Handles reading plain .bz2 (bzip2) compressed files.
@@ -15,51 +23,14 @@ export class Bz2Handler implements IArchiveHandler {
     return lower.endsWith('.bz2') && !lower.endsWith('.tar.bz2');
   }
 
-  /**
-   * Derive the inner filename by stripping the .bz2 extension.
-   */
-  private getInnerName(archivePath: string): string {
-    const base = path.basename(archivePath);
-    return base.replace(/\.bz2$/i, '') || base;
-  }
-
-  async listEntries(archivePath: string): Promise<ArchiveEntry[]> {
-    const stat = fs.statSync(archivePath);
-    const data = await this.decompress(archivePath);
-    const innerName = this.getInnerName(archivePath);
-
-    return [
-      {
-        path: innerName,
-        name: innerName,
-        isDirectory: false,
-        size: data.length,
-        compressedSize: stat.size,
-        modifiedTime: stat.mtime
-      }
-    ];
+  listEntries(archivePath: string): Promise<ArchiveEntry[]> {
+    return listSingleFile(archivePath, innerName(archivePath, EXTENSION), createStream);
   }
 
   async readEntry(archivePath: string, entryPath: string): Promise<Buffer> {
-    const innerName = this.getInnerName(archivePath);
-    if (entryPath !== innerName) {
+    if (entryPath !== innerName(archivePath, EXTENSION)) {
       throw new Error(`Entry not found: ${entryPath}`);
     }
-    return this.decompress(archivePath);
-  }
-
-  private decompress(archivePath: string): Promise<Buffer> {
-    return new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      const decompressor = bz2();
-      const fileStream = fs.createReadStream(archivePath);
-
-      fileStream.on('error', reject);
-      decompressor.on('error', reject);
-      decompressor.on('data', (chunk: Buffer) => chunks.push(chunk));
-      decompressor.on('end', () => resolve(Buffer.concat(chunks)));
-
-      fileStream.pipe(decompressor);
-    });
+    return readSingleFile(archivePath, createStream);
   }
 }

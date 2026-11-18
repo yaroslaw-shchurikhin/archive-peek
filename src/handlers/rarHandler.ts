@@ -1,4 +1,4 @@
-import { ArchiveEntry, IArchiveHandler } from '../models';
+import { ArchiveEntry, IArchiveHandler, ListOptions, TooManyEntriesError } from '../models';
 
 /**
  * Handles reading .rar archive files using node-unrar-js.
@@ -9,7 +9,8 @@ export class RarHandler implements IArchiveHandler {
     return filePath.toLowerCase().endsWith('.rar');
   }
 
-  async listEntries(archivePath: string): Promise<ArchiveEntry[]> {
+  async listEntries(archivePath: string, options?: ListOptions): Promise<ArchiveEntry[]> {
+    const maxEntries = options?.maxEntries ?? Infinity;
     const { createExtractorFromFile } = await import('node-unrar-js');
     const extractor = await createExtractorFromFile({ filepath: archivePath });
     const list = extractor.getFileList();
@@ -58,6 +59,9 @@ export class RarHandler implements IArchiveHandler {
           size: fileHeader.unpSize,
           compressedSize: fileHeader.packSize
         });
+      }
+      if (entries.length > maxEntries) {
+        throw new TooManyEntriesError(maxEntries);
       }
     }
 

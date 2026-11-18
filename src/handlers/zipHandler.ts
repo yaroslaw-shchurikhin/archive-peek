@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import { Readable } from 'stream';
 import * as yauzl from 'yauzl';
-import { ArchiveChangedError, ArchiveEntry, IArchiveHandler } from '../models';
+import { ArchiveChangedError, ArchiveEntry, IArchiveHandler, ListOptions, TooManyEntriesError } from '../models';
 
 /** Size of the read-ahead window used while scanning the central directory. */
 const READ_WINDOW = 64 * 1024;
@@ -59,8 +59,8 @@ export class ZipHandler implements IArchiveHandler {
     return ZipHandler.ZIP_EXTENSIONS.some((ext) => lower.endsWith(ext));
   }
 
-  async listEntries(archivePath: string): Promise<ArchiveEntry[]> {
-    const { entries } = await this.buildIndex(archivePath);
+  async listEntries(archivePath: string, options?: ListOptions): Promise<ArchiveEntry[]> {
+    const { entries } = await this.buildIndex(archivePath, options?.maxEntries);
     return entries;
   }
 
@@ -98,7 +98,10 @@ export class ZipHandler implements IArchiveHandler {
    * Read the central directory: build the entry list for the UI and the
    * location index used by readEntry.
    */
-  private async buildIndex(archivePath: string): Promise<{ entries: ArchiveEntry[]; index: ZipIndex }> {
+  private async buildIndex(
+    archivePath: string,
+    maxEntries = Infinity
+  ): Promise<{ entries: ArchiveEntry[]; index: ZipIndex }> {
     const result = await withOpenFile(archivePath, async (reader, stat) => {
       // decodeStrings: false skips yauzl's file name validation, which rejects
       // the whole archive if any name is absolute or contains "..". We never
@@ -108,6 +111,12 @@ export class ZipHandler implements IArchiveHandler {
         lazyEntries: true,
         decodeStrings: false
       });
+      // The entry count is declared up front in the central directory, so an
+      // over-limit archive is rejected before any entry is parsed.
+      if (zipfile.entryCount > maxEntries) {
+        zipfile.close();
+        throw new TooManyEntriesError(maxEntries);
+      }
 
       const entries: ArchiveEntry[] = [];
       const locations = new Map<string, ZipEntryLocation>();
@@ -154,6 +163,9 @@ export class ZipHandler implements IArchiveHandler {
               compressionMethod: entry.compressionMethod,
               generalPurposeBitFlag: entry.generalPurposeBitFlag
             });
+          }
+          if (entries.length > maxEntries) {
+            throw new TooManyEntriesError(maxEntries);
           }
         }
       } finally {

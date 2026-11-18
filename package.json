@@ -1,9 +1,9 @@
 {
-  "name": "archive-peek",
-  "displayName": "Archive Peek",
-  "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them",
-  "version": "0.0.0",
-  "publisher": "Dzuelu",
+  "name": "archive-peek-remote",
+  "displayName": "Archive Peek (Remote SSH)",
+  "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them. Works with archives on Remote SSH hosts without installing anything on the server.",
+  "version": "0.1.1",
+  "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
     "node": "22.x",
@@ -36,6 +36,12 @@
     "peek"
   ],
   "main": "./out/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onFileSystem:archive"
+  ],
   "contributes": {
     "configuration": {
       "title": "Archive Peek",
@@ -43,7 +49,31 @@
         "archivePeek.autoRefresh": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically refresh opened archives, and any files opened from them, when the archive changes on disk."
+          "description": "Automatically refresh opened archives, and any files opened from them, when the archive changes on disk. Remote archives are refreshed when the remote file system delivers change events (Remote SSH does), when the archive editor becomes active again, and when a file is opened from the archive."
+        },
+        "archivePeek.remote.maxArchiveSizeMB": {
+          "type": "number",
+          "default": 512,
+          "minimum": 1,
+          "markdownDescription": "Largest archive (in MB) that is loaded from a remote host (Remote SSH, WSL, containers…). VS Code's file system API can only transfer a remote file as a whole, so the archive is held in memory once while it is copied to the local temp directory. Larger archives show a warning with a **Load Anyway** button."
+        },
+        "archivePeek.remote.cacheSizeMB": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 1,
+          "markdownDescription": "Maximum total size (in MB) of local copies of remote archives kept in the OS temp directory. Least recently used copies are deleted first; copies are always deleted when the archive is closed and when VS Code exits."
+        },
+        "archivePeek.maxEntries": {
+          "type": "number",
+          "default": 500000,
+          "minimum": 1,
+          "markdownDescription": "Maximum number of entries listed for one archive. Protects against archive bombs with millions of entries."
+        },
+        "archivePeek.maxEntrySizeMB": {
+          "type": "number",
+          "default": 256,
+          "minimum": 1,
+          "markdownDescription": "Largest uncompressed file (in MB) that can be opened from an archive. Protects against decompression bombs."
         }
       }
     },
@@ -167,7 +197,8 @@
     "bench": "vitest bench --run",
     "bench:baseline": "vitest bench --run --outputJson bench-results/baseline.json && BENCH_LABEL=baseline vitest run --config vitest.memory.config.ts",
     "bench:compare": "vitest bench --run --outputJson bench-results/current.json && vitest run --config vitest.memory.config.ts && node scripts/bench-report.mjs",
-    "bench:memory": "vitest run --config vitest.memory.config.ts"
+    "bench:memory": "vitest run --config vitest.memory.config.ts",
+    "package": "vsce package --skip-license --out dist/"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
@@ -184,7 +215,8 @@
     "prettier": "^3.9.9",
     "typescript": "^5.3.3",
     "typescript-eslint": "^8.71.1",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "vscode-uri": "^3.2.0"
   },
   "dependencies": {
     "7zip-bin": "^5.2.0",

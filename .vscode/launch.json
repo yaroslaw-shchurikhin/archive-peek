@@ -8,6 +8,18 @@
       "args": ["--disable-extensions", "--extensionDevelopmentPath=${workspaceFolder}"],
       "outFiles": ["${workspaceFolder}/out/**/*.js"],
       "preLaunchTask": "${defaultBuildTask}"
+    },
+    {
+      // Keeps other extensions (notably Remote - SSH) enabled, so you can connect the
+      // Extension Development Host window to an SSH host (F1 → "Remote-SSH: Connect Current
+      // Window to Host…") and test remote archives. Archive Peek is a UI extension, so it keeps
+      // running locally. Disable an installed copy of Archive Peek first to avoid conflicts.
+      "name": "Run Extension (Remote SSH testing)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "${defaultBuildTask}"
     }
   ]
 }

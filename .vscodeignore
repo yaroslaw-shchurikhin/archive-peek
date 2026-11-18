@@ -10,3 +10,5 @@ eslint.config.mjs
 bench-results
 vitest.memory.config.ts
 scripts
+dist
+.claude
