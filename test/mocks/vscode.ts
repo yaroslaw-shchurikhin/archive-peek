@@ -36,6 +36,53 @@ export enum ExtensionKind {
   Workspace = 2
 }
 
+export enum FilePermission {
+  Readonly = 1
+}
+
+export enum ViewColumn {
+  Active = -1,
+  Beside = -2,
+  One = 1
+}
+
+export enum TreeItemCollapsibleState {
+  None = 0,
+  Collapsed = 1,
+  Expanded = 2
+}
+
+export class ThemeIcon {
+  static readonly File = new ThemeIcon('file');
+  static readonly Folder = new ThemeIcon('folder');
+  constructor(public readonly id: string) {}
+}
+
+export class TreeItem {
+  id?: string;
+  description?: string;
+  tooltip?: string;
+  resourceUri?: URI;
+  iconPath?: ThemeIcon;
+  contextValue?: string;
+  command?: { command: string; title: string; arguments?: unknown[] };
+  constructor(
+    public label: string,
+    public collapsibleState: TreeItemCollapsibleState = TreeItemCollapsibleState.None
+  ) {}
+}
+
+/** In-memory Memento (ExtensionContext.workspaceState). */
+export class MockMemento {
+  private values = new Map<string, unknown>();
+  get<T>(key: string, defaultValue: T): T {
+    return (this.values.has(key) ? this.values.get(key) : defaultValue) as T;
+  }
+  async update(key: string, value: unknown): Promise<void> {
+    this.values.set(key, value);
+  }
+}
+
 export enum ProgressLocation {
   SourceControl = 1,
   Window = 10,
@@ -104,7 +151,10 @@ export class TabInputText {
   constructor(public readonly uri: URI) {}
 }
 export class TabInputCustom {
-  constructor(public readonly uri: URI) {}
+  constructor(
+    public readonly uri: URI,
+    public readonly viewType = 'archivePeek.archiveEditor'
+  ) {}
 }
 export class TabInputTextDiff {
   constructor(
@@ -173,8 +223,34 @@ export class MockFileSystemWatcher {
 export const configuration: Record<string, unknown> = {};
 const configListeners = new EventEmitter<{ affectsConfiguration(key: string): boolean }>();
 
+/** Workspace folders; tests assign this directly. */
+export const workspaceState = {
+  folders: undefined as { uri: URI; name: string; index: number }[] | undefined,
+  workspaceFile: undefined as URI | undefined
+};
+
 export const workspace = {
   textDocuments: [] as { uri: URI }[],
+  get workspaceFolders() {
+    return workspaceState.folders;
+  },
+  get workspaceFile() {
+    return workspaceState.workspaceFile;
+  },
+  getWorkspaceFolder(uri: URI) {
+    return workspaceState.folders?.find(
+      (f) =>
+        f.uri.scheme === uri.scheme &&
+        f.uri.authority === uri.authority &&
+        (uri.path === f.uri.path || uri.path.startsWith(f.uri.path.replace(/\/$/, '') + '/'))
+    );
+  },
+  updateWorkspaceFolders(start: number, deleteCount: number, ...add: { uri: URI; name?: string }[]): boolean {
+    const folders = [...(workspaceState.folders ?? [])];
+    folders.splice(start, deleteCount, ...add.map((f) => ({ uri: f.uri, name: f.name ?? f.uri.path, index: 0 })));
+    workspaceState.folders = folders.map((f, index) => ({ ...f, index }));
+    return true;
+  },
   fs: {
     async stat(uri: URI): Promise<FileStat> {
       if (uri.scheme === 'file') {
@@ -233,9 +309,45 @@ export const workspace = {
 
 /** Messages shown through window.show*Message, for assertions. */
 export const shownMessages: { level: string; message: string }[] = [];
+/** Answer returned by the next show*Message call (e.g. a modal confirmation button). */
+export const messageAnswers: (string | undefined)[] = [];
+
+/** Tree views created through window.createTreeView, for assertions. */
+export const createdTreeViews: MockTreeView[] = [];
+
+export class MockTreeView {
+  revealed: { element: unknown; options: unknown }[] = [];
+  constructor(
+    public readonly id: string,
+    public readonly options: { treeDataProvider: unknown }
+  ) {}
+  async reveal(element: unknown, options?: unknown): Promise<void> {
+    this.revealed.push({ element, options });
+  }
+  dispose(): void {}
+}
 
 export const window = {
-  tabGroups: { all: [] as { tabs: { input: unknown }[] }[] },
+  tabGroups: {
+    all: [] as { tabs: { input: unknown }[] }[],
+    async close(tab: unknown) {
+      for (const group of window.tabGroups.all) {
+        const i = group.tabs.indexOf(tab as { input: unknown });
+        if (i !== -1) {
+          group.tabs.splice(i, 1);
+        }
+      }
+      return true;
+    }
+  },
+  createTreeView(id: string, options: { treeDataProvider: unknown }) {
+    const view = new MockTreeView(id, options);
+    createdTreeViews.push(view);
+    return view;
+  },
+  async showOpenDialog() {
+    return undefined;
+  },
   async withProgress<T>(
     _options: unknown,
     task: (progress: { report(value: { message?: string }): void }, token: unknown) => Promise<T>
@@ -244,20 +356,43 @@ export const window = {
   },
   async showErrorMessage(message: string) {
     shownMessages.push({ level: 'error', message });
-    return undefined;
+    return messageAnswers.shift();
   },
   async showWarningMessage(message: string) {
     shownMessages.push({ level: 'warning', message });
-    return undefined;
+    return messageAnswers.shift();
   },
   async showInformationMessage(message: string) {
     shownMessages.push({ level: 'info', message });
-    return undefined;
+    return messageAnswers.shift();
   }
 };
 
+/** Commands run through commands.executeCommand, for assertions. */
+export const executedCommands: { command: string; args: unknown[] }[] = [];
+export const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
+
 export const commands = {
-  async executeCommand() {
-    return undefined;
+  async executeCommand(command: string, ...args: unknown[]) {
+    executedCommands.push({ command, args });
+    const handler = registeredCommands.get(command);
+    return handler ? handler(...args) : undefined;
+  },
+  registerCommand(command: string, handler: (...args: unknown[]) => unknown) {
+    registeredCommands.set(command, handler);
+    return new Disposable(() => registeredCommands.delete(command));
+  }
+};
+
+export const clipboardState = { text: '' };
+export const env = {
+  remoteName: undefined as string | undefined,
+  clipboard: {
+    async writeText(text: string) {
+      clipboardState.text = text;
+    },
+    async readText() {
+      return clipboardState.text;
+    }
   }
 };

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { ArchiveChangeEvent, ArchiveManager } from './archiveManager';
 import { archiveBaseName, describeArchiveId, normalizeArchiveId } from './archiveId';
+import { ArchiveIndex } from './archiveIndex';
 import { EntryTooLargeError, Logger, NULL_LOGGER } from './models';
 import { describeError } from './sourceErrors';
 
@@ -147,42 +148,25 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
       };
     }
 
-    // Look up the entry
-    const entry = archive.entries.find((e) => {
-      const normalized = e.path.replace(/\/$/, '');
-      return normalized === entryPath || normalized === entryPath.replace(/\/$/, '');
-    });
-
-    if (!entry) {
-      // Could be an implicit directory that wasn't listed as an entry
-      // Check if any entries start with this path prefix
-      const prefix = entryPath.endsWith('/') ? entryPath : entryPath + '/';
-      const hasChildren = archive.entries.some((e) => e.path.startsWith(prefix));
-      if (hasChildren) {
-        return {
-          type: vscode.FileType.Directory,
-          ctime,
-          mtime: archive.diskMtime,
-          size: 0
-        };
-      }
+    const node = ArchiveIndex.for(archive.entries).get(entryPath);
+    if (!node) {
       throw vscode.FileSystemError.FileNotFound(uri);
     }
-
-    if (entry.isDirectory) {
+    if (node.isDirectory) {
       return {
         type: vscode.FileType.Directory,
         ctime,
-        mtime: mtimeOf(entry.modifiedTime),
-        size: 0
+        mtime: mtimeOf(node.entry?.modifiedTime),
+        size: 0,
+        permissions: vscode.FilePermission?.Readonly
       };
     }
-
     return {
       type: vscode.FileType.File,
       ctime,
-      mtime: mtimeOf(entry.modifiedTime),
-      size: entry.size
+      mtime: mtimeOf(node.entry?.modifiedTime),
+      size: node.entry?.size ?? 0,
+      permissions: vscode.FilePermission?.Readonly
     };
   }
 
@@ -200,20 +184,18 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
       throw vscode.FileSystemError.FileNotFound(uri);
     }
 
-    const children = this.archiveManager.getChildren(archive, entryPath);
-
-    // Sort: directories first, then alphabetically
-    children.sort((a, b) => {
-      if (a.isDirectory && !b.isDirectory) {
-        return -1;
-      }
-      if (!a.isDirectory && b.isDirectory) {
-        return 1;
-      }
-      return a.name.localeCompare(b.name);
-    });
-
-    return children.map((child) => [child.name, child.isDirectory ? vscode.FileType.Directory : vscode.FileType.File]);
+    const index = ArchiveIndex.for(archive.entries);
+    const node = index.get(entryPath);
+    if (!node) {
+      throw vscode.FileSystemError.FileNotFound(uri);
+    }
+    if (!node.isDirectory) {
+      throw vscode.FileSystemError.FileNotADirectory(uri);
+    }
+    // Directories first, then files (including directories the archive doesn't list explicitly)
+    return index
+      .children(entryPath)
+      .map((child) => [child.name, child.isDirectory ? vscode.FileType.Directory : vscode.FileType.File]);
   }
 
   async readFile(uri: vscode.Uri): Promise<Uint8Array> {
@@ -223,22 +205,30 @@ export class ArchiveFileSystemProvider implements vscode.FileSystemProvider, vsc
       throw vscode.FileSystemError.FileIsADirectory(uri);
     }
 
+    let archive;
     try {
-      const buffer = await this.archiveManager.readEntry(archivePath, entryPath);
-      return new Uint8Array(buffer);
-    } catch (error: any) {
+      archive = this.archiveManager.getArchive(archivePath) ?? (await this.archiveManager.openArchive(archivePath));
+    } catch (error) {
       this.logFailure('read', archivePath, entryPath, error);
-      if (error instanceof EntryTooLargeError) {
-        throw vscode.FileSystemError.NoPermissions(error.message);
-      }
-      const { kind, message } = describeError(error);
-      if (kind === 'unavailable') {
-        throw vscode.FileSystemError.Unavailable(message);
-      }
-      if (kind === 'no-permission') {
-        throw vscode.FileSystemError.NoPermissions(message);
-      }
+      throw toFileSystemError(error, uri);
+    }
+    // Answer lookups of paths the archive doesn't contain from the index. VS Code
+    // probes many (e.g. .vscode/settings.json when the archive is a workspace folder).
+    const node = ArchiveIndex.for(archive.entries).get(entryPath);
+    if (!node) {
       throw vscode.FileSystemError.FileNotFound(uri);
+    }
+    if (node.isDirectory) {
+      throw vscode.FileSystemError.FileIsADirectory(uri);
+    }
+
+    try {
+      // Paths in archive:// URIs come from the directory index; read the entry under the name the archive lists
+      const buffer = await this.archiveManager.readEntry(archivePath, node.entry?.path ?? entryPath);
+      return new Uint8Array(buffer);
+    } catch (error) {
+      this.logFailure('read', archivePath, entryPath, error);
+      throw toFileSystemError(error, uri);
     }
   }
 
@@ -300,4 +290,19 @@ function openArchiveUris(authority: string): vscode.Uri[] {
     }
   }
   return [...uris.values()];
+}
+
+/** Map a failure to read an archive or entry to the FileSystemError VS Code shows. */
+function toFileSystemError(error: unknown, uri: vscode.Uri): vscode.FileSystemError {
+  if (error instanceof EntryTooLargeError) {
+    return vscode.FileSystemError.NoPermissions(error.message);
+  }
+  const { kind, message } = describeError(error);
+  if (kind === 'unavailable') {
+    return vscode.FileSystemError.Unavailable(message);
+  }
+  if (kind === 'no-permission' || kind === 'too-large' || kind === 'too-many-entries') {
+    return vscode.FileSystemError.NoPermissions(message);
+  }
+  return vscode.FileSystemError.FileNotFound(uri);
 }

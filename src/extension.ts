@@ -3,11 +3,11 @@ import { ArchiveManager } from './archiveManager';
 import { ArchiveFileSystemProvider, ARCHIVE_SCHEME } from './archiveFileSystemProvider';
 import { ArchiveEditorProvider } from './archiveEditorProvider';
 import { ArchiveWatcher } from './archiveWatcher';
-import { archiveBaseName, archivePathPart, describeArchiveId, isRemoteId, remoteLabel } from './archiveId';
+import { archiveBaseName, archivePathPart, isRemoteId, remoteLabel } from './archiveId';
 import { OutputChannelLogger } from './logger';
 import { RemoteArchiveCache } from './remoteArchiveCache';
-import { archiveLimits, maxRemoteArchiveBytes, maxRemoteCacheBytes } from './config';
-import { describeError } from './sourceErrors';
+import { archiveLimits, maxRemoteArchiveBytes, maxRemoteCacheBytes, openMode } from './config';
+import { pickArchive, refreshArchiveSource, registerExplorerIntegration } from './explorerIntegration';
 import { archiveIdFromUri, VscodeRemoteFileAccess } from './vscodeFileAccess';
 
 let archiveManager: ArchiveManager;
@@ -47,8 +47,18 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // "Archive Peek" section of the Explorer: archives as expandable read-only folders
+  const explorer = registerExplorerIntegration(context, {
+    archiveManager,
+    logger,
+    showLog: () => logger.show(),
+    state: context.workspaceState
+  });
+
   // Register the custom editor — clicking an archive opens stats + embedded file tree
+  // (or, with archivePeek.openMode = explorerTree, shows it in the Explorer tree instead)
   const editorProvider = new ArchiveEditorProvider(archiveManager, {
+    ...explorer.editorHooks,
     logger,
     showLog: () => logger.show(),
     onDidActivate: (archiveId) => {
@@ -65,60 +75,12 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // ─── Command: Open Archive ───────────────────────────────────────────
+  // ─── Command: Open Archive (follows archivePeek.openMode) ───────────
   context.subscriptions.push(
     vscode.commands.registerCommand('archivePeek.openArchive', async (uri?: vscode.Uri) => {
-      let archiveUri: vscode.Uri;
-
-      if (uri) {
-        archiveUri = uri;
-      } else {
-        const result = await vscode.window.showOpenDialog({
-          canSelectFiles: true,
-          canSelectFolders: false,
-          canSelectMany: false,
-          openLabel: 'Open Archive',
-          filters: {
-            Archives: [
-              'zip',
-              '7z',
-              'rar',
-              'tar',
-              'gz',
-              'bz2',
-              'xz',
-              'tar.gz',
-              'tgz',
-              'tar.bz2',
-              'tbz2',
-              'tar.xz',
-              'txz',
-              'jar',
-              'war',
-              'ear',
-              'vsix',
-              'nupkg',
-              'apk',
-              'whl',
-              'xpi',
-              'epub',
-              'aar'
-            ],
-            'ZIP Files': ['zip', 'jar', 'war', 'ear', 'vsix', 'nupkg', 'apk', 'whl', 'xpi', 'epub', 'aar'],
-            '7-Zip Files': ['7z'],
-            'RAR Files': ['rar'],
-            'GZip Files': ['gz'],
-            'BZip2 Files': ['bz2'],
-            'XZ Files': ['xz'],
-            'Tar Files': ['tar', 'tar.gz', 'tgz', 'tar.bz2', 'tbz2', 'tar.xz', 'txz'],
-            'All Files': ['*']
-          }
-        });
-
-        if (!result || result.length === 0) {
-          return;
-        }
-        archiveUri = result[0];
+      const archiveUri = uri ?? (await pickArchive('Open Archive'));
+      if (!archiveUri) {
+        return;
       }
 
       // Keep scheme + authority (vscode-remote://…); never use fsPath for remote resources
@@ -129,13 +91,12 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      // The custom editor loads the archive (with progress and error reporting)
-      try {
-        await vscode.commands.executeCommand('vscode.openWith', archiveUri, ArchiveEditorProvider.viewType);
-      } catch (error: any) {
-        logger.error(`Failed to open ${describeArchiveId(archivePath, { redactHost: true })}: ${error.message}`);
-        vscode.window.showErrorMessage(`Failed to open archive: ${error.message}`);
+      if (openMode() === 'explorerTree') {
+        await explorer.openInTree(archivePath);
+        return;
       }
+      // The custom editor loads the archive (with progress and error reporting)
+      await vscode.commands.executeCommand('archivePeek.openInViewer', archiveUri);
     })
   );
 
@@ -147,25 +108,9 @@ export function activate(context: vscode.ExtensionContext) {
         { location: vscode.ProgressLocation.Window, title: 'Archive Peek: refreshing archives' },
         async (progress) => {
           for (const archive of archives) {
-            const name = archiveBaseName(archive.filePath);
-            progress.report({ message: name });
-            try {
-              const state = await archiveManager.probe(archive.filePath);
-              if (state === 'missing') {
-                archiveManager.markDeleted(archive.filePath);
-                continue;
-              }
-              await archiveManager.refreshArchive(archive.filePath, {
-                onProgress: (message) => progress.report({ message: `${name}: ${message}` })
-              });
-              logger.info(`Refreshed ${describeArchiveId(archive.filePath, { redactHost: true })}`);
-            } catch (error) {
-              const { kind, message } = describeError(error);
-              logger.warn(
-                `Failed to refresh ${describeArchiveId(archive.filePath, { redactHost: true })} [${kind}]: ${message}`
-              );
-              vscode.window.showWarningMessage(`Failed to refresh ${name}: ${message}`);
-            }
+            await refreshArchiveSource(archiveManager, archive.filePath, logger, (message) =>
+              progress.report({ message })
+            );
           }
         }
       );
@@ -196,6 +141,7 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       archiveManager.closeArchive(picked.archivePath);
+      explorer.tree.remove(picked.archivePath);
     })
   );
 }

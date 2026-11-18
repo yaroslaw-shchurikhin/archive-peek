@@ -71,6 +71,10 @@ export class FakeRemoteFileSystemProvider {
     this.denied.add(path);
   }
 
+  allow(path: string): void {
+    this.denied.delete(path);
+  }
+
   private check(uri: URI): void {
     if (uri.authority !== this.authority) {
       throw this.unknownAuthority === 'NoPermissions'

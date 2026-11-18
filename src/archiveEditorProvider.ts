@@ -8,7 +8,7 @@ import { archiveIdFromUri } from './vscodeFileAccess';
 
 /** A loading or error state shown instead of the archive contents. */
 interface ViewStatus {
-  kind: 'loading' | 'error';
+  kind: 'loading' | 'error' | 'info';
   message: string;
   actions?: { command: string; label: string }[];
 }
@@ -20,6 +20,14 @@ export interface ArchiveEditorHooks {
   showLog?: () => void;
   /** Called when an archive editor becomes active again (cheap change check) */
   onDidActivate?: (archiveId: string) => void;
+  /**
+   * Called before an archive is shown. Returning true means the archive was
+   * opened elsewhere instead (the Explorer tree, archivePeek.openMode), so
+   * this editor shows a short note and closes itself.
+   */
+  redirect?: (archiveId: string) => boolean;
+  /** Show this archive in the viewer even if redirect() would move it elsewhere */
+  forceViewer?: (archiveId: string) => void;
 }
 
 /**
@@ -73,6 +81,30 @@ export class ArchiveEditorProvider implements vscode.CustomReadonlyEditorProvide
 
     webviewPanel.webview.options = { enableScripts: true };
     let disposed = false;
+
+    if (this.hooks.redirect?.(archivePath)) {
+      this.render(webviewPanel, fileName, archivePath, undefined, undefined, {
+        kind: 'info',
+        message: 'Opened in the Archive Peek section of the Explorer (setting "archivePeek.openMode").',
+        actions: [
+          { command: 'showHere', label: 'Show Here' },
+          { command: 'openSettings', label: 'Settings' }
+        ]
+      });
+      const messages = webviewPanel.webview.onDidReceiveMessage(async (message) => {
+        if (message.command === 'showHere') {
+          messages.dispose();
+          this.hooks.forceViewer?.(archivePath);
+          await vscode.commands.executeCommand('vscode.openWith', document.uri, ArchiveEditorProvider.viewType);
+        } else if (message.command === 'openSettings') {
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'archivePeek.openMode');
+        }
+      });
+      webviewPanel.onDidDispose(() => messages.dispose());
+      // Close this tab once VS Code has finished opening it
+      setTimeout(() => void closeEditorTab(document.uri), 0);
+      return;
+    }
 
     const load = async () => {
       this.render(webviewPanel, fileName, archivePath, undefined, undefined, {
@@ -688,4 +720,26 @@ function formatSize(bytes: number): string {
 function displayLocation(archivePath: string): string {
   const label = remoteLabel(archivePath);
   return label ? `[${label}] ${archivePathPart(archivePath)}` : archivePath;
+}
+
+/** Close the custom editor tab showing `uri`, if it is still open. */
+async function closeEditorTab(uri: vscode.Uri): Promise<void> {
+  const target = uri.toString();
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const input = tab.input;
+      if (
+        input instanceof vscode.TabInputCustom &&
+        input.viewType === ArchiveEditorProvider.viewType &&
+        input.uri.toString() === target
+      ) {
+        try {
+          await vscode.window.tabGroups.close(tab, true);
+        } catch {
+          // Leave the note visible; the user can close the tab
+        }
+        return;
+      }
+    }
+  }
 }

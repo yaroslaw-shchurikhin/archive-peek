@@ -5,6 +5,9 @@ Peek inside archive files directly in VS Code — without extracting them to dis
 > **This build adds Remote SSH support** (`local.archive-peek-remote`): archives on a Remote SSH host
 > open the same way as local ones, without installing anything on the server. See
 > [Remote SSH Support](#remote-ssh-support).
+>
+> **Since 0.2.0 archives can also be browsed as expandable folders in the Explorer side bar** —
+> see [Explorer Integration](#explorer-integration).
 
 ![Archive Peek screenshot](images/Screenshot.png)
 
@@ -36,7 +39,8 @@ Peek inside archive files directly in VS Code — without extracting them to dis
 - **Open files inline** — click any file in the archive tree to view its contents in VS Code (read-only)
 - **No extraction** — files are read directly from the archive stream; local archives are never copied (remote archives are copied once into the local temp directory, see [Remote SSH Support](#remote-ssh-support))
 - **Remote SSH** — click an archive on a Remote SSH host (or WSL / Dev Container / any VS Code file system) and browse it like a local one; nothing is installed on or written to the remote host
-- **No sidebar clutter** — everything lives in the editor tab, no extra panels
+- **Two ways to browse** — the archive viewer (an editor tab with stats and a file tree), or the **Archive Peek** section of the Explorer, where archives expand like read-only folders next to your files; pick the default with `archivePeek.openMode`
+- **Archive as a workspace folder** — on request, add an archive to the workspace as a read-only folder that the regular Explorer tree shows
 - **23 file extensions** — covers ZIP-based, tar variants, standalone compressed, RAR, and 7z out of the box
 - **Context menu integration** — right-click archive files in the Explorer for quick access
 - **Auto-refresh** — when an opened archive is rebuilt or replaced on disk, the archive tab and any files opened from it reload automatically
@@ -48,25 +52,139 @@ Peek inside archive files directly in VS Code — without extracting them to dis
 2. The archive opens in an editor tab showing format info, file/directory counts, total size, and a browsable file tree
 3. Click any file in the tree to view its contents
 
-You can also right-click an archive and select **Open Archive**, or use the command palette: `Archive Peek: Open Archive`.
+Right-click an archive in the Explorer for:
+
+- **Open in Archive Peek View** — show it as an expandable folder in the Archive Peek section of the Explorer
+- **Open in Archive Viewer** — the editor-tab viewer
+- **Add Archive to Workspace as Read-Only Folder** — mount it in the regular Explorer tree (asks first)
+
+To make clicking an archive open it in the Explorer tree instead of the viewer, set
+`"archivePeek.openMode": "explorerTree"`. The command palette has `Archive Peek: Open Archive`
+(follows that setting) and the commands below.
 
 ## Commands
 
 | Command                          | Description                                |
 |----------------------------------|--------------------------------------------|
-| `Archive Peek: Open Archive`    | Open an archive file for browsing          |
-| `Archive Peek: Refresh`          | Re-read all opened archives and reload files opened from them |
+| `Archive Peek: Open Archive`    | Open an archive file for browsing (in the viewer or the Explorer tree, per `archivePeek.openMode`) |
+| `Archive Peek: Open in Archive Peek View` | Show an archive as an expandable folder in the Explorer's Archive Peek section |
+| `Archive Peek: Open in Archive Viewer` | Open an archive in the editor-tab viewer |
+| `Archive Peek: Add Archive to Workspace as Read-Only Folder` | Mount an archive as a workspace folder (archive:// file system) |
+| `Archive Peek: Refresh Archives` | Re-read all opened archives and reload files opened from them |
+| `Archive Peek: Refresh All Archives` / `Close All Archives` | The same, for the archives in the Explorer tree |
 | `Archive Peek: Close Archive`    | Close an opened archive                    |
+| `Archive Peek: Show Log`         | Show the Archive Peek output channel |
+
+In the Archive Peek section, right-click an item for **Open**, **Open to the Side**, **Open in
+Archive Viewer**, **Reveal Archive in Explorer**, **Copy Path** (archive path, or
+`archive path/entry path`), **Copy Path Inside Archive**, **Refresh**, **Add to Workspace as
+Read-Only Folder** and **Close Archive**. Refresh and Close are also inline buttons on each archive.
 
 ## Settings
 
 | Setting                  | Default | Description                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------------|
+| `archivePeek.openMode` | `viewer` | How archives open when clicked in the Explorer: `viewer` (editor tab) or `explorerTree` (expandable folder in the Archive Peek section of the Explorer). The other mode stays available from the context menu |
 | `archivePeek.autoRefresh` | `true`  | Reload opened archives (and files opened from them) when they change on disk |
 | `archivePeek.remote.maxArchiveSizeMB` | `512` | Largest remote archive that is loaded (see [memory use](#memory-use-and-size-limit)). Larger archives show a warning with **Load Anyway** |
 | `archivePeek.remote.cacheSizeMB` | `2048` | Total size of local copies of remote archives kept in the OS temp directory (LRU) |
 | `archivePeek.maxEntries` | `500000` | Maximum number of entries per archive (archive-bomb protection) |
 | `archivePeek.maxEntrySizeMB` | `256` | Largest uncompressed file that can be opened from an archive (decompression-bomb protection) |
+
+## Explorer Integration
+
+Archives can be browsed as expandable, read-only folders in the Explorer side bar:
+
+```
+EXPLORER
+├── MY-PROJECT
+│   └── reports/
+│       ├── pre_check.tar.gz
+│       └── post_check.tar.gz
+└── ARCHIVE PEEK
+    ├── pre_check.tar.gz           SSH: build-01 · /tmp/work/var/reports
+    │   ├── logs/
+    │   │   ├── service.log        12.4 KB
+    │   │   └── system.log         3.1 KB
+    │   ├── config.json            220 B
+    │   └── report.txt             1.2 KB
+    └── post_check.tar.gz          SSH: build-01 · /tmp/work/var/reports
+```
+
+### Which integration was chosen, and why
+
+The three options from the public VS Code Extension API, in order of preference:
+
+1. **Expanding the archive file itself inside the regular Explorer tree — not possible.** The
+   Explorer tree is built by VS Code from the workspace folders' FileSystemProviders, and a node that
+   the provider reports as a *file* can never get children. The public API has no way to add children
+   to, or replace, a node of the built-in Explorer (`FileDecorationProvider` can only add a badge,
+   color and tooltip). Doing it anyway would need internal APIs, patched VS Code sources or injected
+   workbench JavaScript, which this extension deliberately does not use.
+2. **The archive as a read-only workspace folder in the regular Explorer — implemented, on request.**
+   The existing `archive://` FileSystemProvider (read-only) serves the archive's contents, and
+   `workspace.updateWorkspaceFolders` adds `archive://…/name.tar.gz` as a workspace folder, so the
+   standard Explorer shows it with all its features. This changes the workspace, so it is only done
+   via the explicit command **Add Archive to Workspace as Read-Only Folder** (Explorer context menu,
+   tree context menu, command palette) after a confirmation. It works in Remote SSH windows: the
+   provider runs in the local extension host, and VS Code routes `archive://` requests to it.
+3. **A dedicated "Archive Peek" section inside the Explorer side bar (TreeDataProvider) — the main
+   mode.** Archives appear as top-level nodes that expand like folders, without touching the
+   workspace. Several archives can be open at the same time.
+
+### What the Archive Peek section does
+
+- **Native look**: files and folders use `ThemeIcon.File` / `ThemeIcon.Folder` with an `archive://`
+  `resourceUri`, so the current file icon theme picks icons by file name and extension. The archive
+  node uses the archive's own URI, so it gets the archive's icon and its Explorer decorations
+  (e.g. git status).
+- **Open files in regular editor tabs**: clicking a file runs `vscode.open` on its `archive://` URI.
+  The language (and therefore syntax highlighting) is detected from the file's extension, binary
+  files and images get VS Code's normal handling, and editors are read-only because the file system
+  is registered with `isReadonly: true` (writes are rejected; the archive is never modified).
+- **Focus**: opening an archive reveals, selects, expands and focuses its node.
+- **Stable ids** (archive id + path inside the archive): expanded folders and the selection survive
+  a refresh, including the automatic refresh when the archive changes on disk.
+- **Same names**: each archive node shows its location as description — the directory for local
+  archives, `SSH: host · /remote/dir` (or `scheme: authority · /dir`) for remote ones — and archives
+  are keyed by their full, case-preserving id, so equal names in other folders or on other hosts
+  never collide.
+- **Errors in place**: permission problems, lost connections, the remote size limit (with **Load
+  Anyway**), deleted archives and empty archives are shown as a line under the archive, with a
+  click to retry.
+- The list of archives is remembered per workspace; archives are restored collapsed and are **not**
+  loaded until they are expanded.
+- **Close Archive** frees the archive's memory and the local copy of a remote archive, unless the
+  archive is still shown in a viewer tab, an editor, or as a workspace folder.
+
+### Performance
+
+The tree is a view over the existing machinery, not a second archive implementation: loading,
+caching, change detection and size/bomb limits are those of `ArchiveManager` and
+`RemoteArchiveCache`. The flat entry list is indexed once per archive version (`ArchiveIndex`) and
+the same index serves the tree and the `archive://` file system.
+
+- Adding an archive costs nothing; it is loaded on first expansion (for a remote archive: one `stat`
+  + one transfer, exactly as in the viewer).
+- Expanding folders afterwards only reads the in-memory index: no file system requests, no second
+  transfer.
+- File contents are read only when a file is opened (remote archives: from the local copy, after a
+  single `stat` that checks the archive hasn't changed).
+- Nothing scans the workspace for archives; only archives the user opens are touched.
+
+### Limitations of the public API
+
+- An archive file in the regular Explorer cannot itself be expanded (see above); use the Archive Peek
+  section or mount the archive as a workspace folder.
+- Adding a folder to a window that has a single folder open turns it into an (untitled) multi-root
+  workspace, and VS Code restarts the extension host. This is VS Code's behavior and the reason
+  mounting asks first.
+- **Search** (Ctrl+P, Find in Files) does not cover mounted archive folders: that needs
+  `FileSearchProvider` / `TextSearchProvider`, which are proposed APIs (not in the stable `@types/vscode`) that an installed VSIX cannot use.
+- The tree's icons follow the icon theme by file name; folder-specific icons depend on the theme.
+- With `archivePeek.openMode: "explorerTree"`, clicking an archive still briefly opens the viewer
+  tab: archives are bound to the custom editor in `package.json`, which can't change at runtime. The
+  viewer immediately hands the archive to the tree and closes its tab.
 
 ## Remote SSH Support
 
@@ -208,10 +326,12 @@ possible but need correspondingly more free RAM during the transfer.
 The VSIX is built into `dist/`. Install it **into the local VS Code only** — never into the remote:
 
 ```bash
-code --install-extension dist/archive-peek-remote-0.1.1.vsix
+code --install-extension dist/archive-peek-remote-0.2.0.vsix --force
 ```
 
-(or Extensions view → `…` → **Install from VSIX…**, *in a local window*). Because of
+(or Extensions view → `…` → **Install from VSIX…**, *in a local window*), then run
+**Developer: Reload Window**. 0.2.0 installs over 0.1.x (same identifier
+`local.archive-peek-remote`); settings and everything else carry over. Because of
 `extensionKind: ["ui"]`, VS Code runs it locally in Remote SSH windows; it does not offer to
 install it "in SSH: host" and you should not use **Install in SSH**.
 
@@ -240,7 +360,11 @@ Settings (`archivePeek.*`) are shared by both versions.
    extension host); remote window: ssh-remote`), the transfer size and time, and any errors.
 5. Rebuild or `touch` the archive on the server: the view reloads (or switch tabs / run
    **Archive Peek: Refresh Archives**).
-6. Nothing is left on the server; local copies are in `<os.tmpdir()>/archive-peek-remote-*` and
+6. Right-click the archive → **Open in Archive Peek View**: the **Archive Peek** section of the
+   Explorer gets focus with the archive expanded and `SSH: <host> · /path` next to its name. Expand
+   folders, click a file (it opens in a normal tab), right-click → **Copy Path**, **Refresh**,
+   **Close Archive**.
+7. Nothing is left on the server; local copies are in `<os.tmpdir()>/archive-peek-remote-*` and
    disappear when the archive is closed or VS Code exits.
 
 The automated tests emulate a remote host with an in-memory FileSystemProvider

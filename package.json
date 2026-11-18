@@ -1,8 +1,8 @@
 {
   "name": "archive-peek-remote",
   "displayName": "Archive Peek (Remote SSH)",
-  "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them. Works with archives on Remote SSH hosts without installing anything on the server.",
-  "version": "0.1.1",
+  "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them, in a viewer or as expandable folders in the Explorer. Works with archives on Remote SSH hosts without installing anything on the server.",
+  "version": "0.2.0",
   "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
@@ -46,6 +46,19 @@
     "configuration": {
       "title": "Archive Peek",
       "properties": {
+        "archivePeek.openMode": {
+          "type": "string",
+          "enum": [
+            "viewer",
+            "explorerTree"
+          ],
+          "default": "viewer",
+          "enumDescriptions": [
+            "Open archives in the Archive Peek viewer (an editor tab with statistics and a file tree).",
+            "Show archives as expandable read-only folders in the Archive Peek section of the Explorer side bar."
+          ],
+          "markdownDescription": "How archives open when you click them in the Explorer or run **Archive Peek: Open Archive**. The other mode stays available from the context menu (**Open in Archive Peek View** / **Open in Archive Viewer**)."
+        },
         "archivePeek.autoRefresh": {
           "type": "boolean",
           "default": true,
@@ -85,6 +98,30 @@
         "icon": "$(file-zip)"
       },
       {
+        "command": "archivePeek.openInTree",
+        "title": "Open in Archive Peek View",
+        "category": "Archive Peek",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "archivePeek.openInViewer",
+        "title": "Open in Archive Viewer",
+        "category": "Archive Peek",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "archivePeek.mountAsWorkspaceFolder",
+        "title": "Add Archive to Workspace as Read-Only Folder",
+        "category": "Archive Peek",
+        "icon": "$(root-folder)"
+      },
+      {
+        "command": "archivePeek.unmountWorkspaceFolder",
+        "title": "Remove Archive Folder from Workspace",
+        "category": "Archive Peek",
+        "icon": "$(close)"
+      },
+      {
         "command": "archivePeek.refresh",
         "title": "Refresh Archives",
         "category": "Archive Peek",
@@ -95,14 +132,230 @@
         "title": "Close Archive",
         "category": "Archive Peek",
         "icon": "$(close)"
+      },
+      {
+        "command": "archivePeek.showLog",
+        "title": "Show Log",
+        "category": "Archive Peek",
+        "icon": "$(output)"
+      },
+      {
+        "command": "archivePeek.tree.open",
+        "title": "Open",
+        "category": "Archive Peek"
+      },
+      {
+        "command": "archivePeek.tree.openToSide",
+        "title": "Open to the Side",
+        "category": "Archive Peek"
+      },
+      {
+        "command": "archivePeek.tree.openInViewer",
+        "title": "Open in Archive Viewer",
+        "category": "Archive Peek",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "archivePeek.tree.refresh",
+        "title": "Refresh",
+        "category": "Archive Peek",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "archivePeek.tree.refreshAll",
+        "title": "Refresh All Archives",
+        "category": "Archive Peek",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "archivePeek.tree.close",
+        "title": "Close Archive",
+        "category": "Archive Peek",
+        "icon": "$(close)"
+      },
+      {
+        "command": "archivePeek.tree.closeAll",
+        "title": "Close All Archives",
+        "category": "Archive Peek",
+        "icon": "$(close-all)"
+      },
+      {
+        "command": "archivePeek.tree.copyPath",
+        "title": "Copy Path",
+        "category": "Archive Peek"
+      },
+      {
+        "command": "archivePeek.tree.copyPathInArchive",
+        "title": "Copy Path Inside Archive",
+        "category": "Archive Peek"
+      },
+      {
+        "command": "archivePeek.tree.revealSource",
+        "title": "Reveal Archive in Explorer",
+        "category": "Archive Peek"
+      },
+      {
+        "command": "archivePeek.tree.mount",
+        "title": "Add to Workspace as Read-Only Folder",
+        "category": "Archive Peek",
+        "icon": "$(root-folder)"
+      },
+      {
+        "command": "archivePeek.tree.retry",
+        "title": "Retry",
+        "category": "Archive Peek"
+      },
+      {
+        "command": "archivePeek.tree.loadAnyway",
+        "title": "Load Anyway",
+        "category": "Archive Peek"
       }
     ],
     "menus": {
       "explorer/context": [
         {
-          "command": "archivePeek.openArchive",
-          "when": "resourceExtname == .zip || resourceExtname == .7z || resourceExtname == .gz || resourceExtname == .bz2 || resourceExtname == .xz || resourceExtname == .tar || resourceExtname == .jar || resourceExtname == .war || resourceExtname == .ear || resourceExtname == .vsix || resourceExtname == .nupkg || resourceExtname == .apk || resourceExtname == .whl || resourceExtname == .xpi || resourceExtname == .epub || resourceExtname == .aar || resourceExtname == .rar || resourceExtname == .tgz || resourceExtname == .tbz2 || resourceExtname == .txz",
-          "group": "navigation"
+          "command": "archivePeek.openInTree",
+          "when": "!explorerResourceIsFolder && (resourceExtname == .zip || resourceExtname == .7z || resourceExtname == .gz || resourceExtname == .bz2 || resourceExtname == .xz || resourceExtname == .tar || resourceExtname == .jar || resourceExtname == .war || resourceExtname == .ear || resourceExtname == .vsix || resourceExtname == .nupkg || resourceExtname == .apk || resourceExtname == .whl || resourceExtname == .xpi || resourceExtname == .epub || resourceExtname == .aar || resourceExtname == .rar || resourceExtname == .tgz || resourceExtname == .tbz2 || resourceExtname == .txz)",
+          "group": "navigation@20"
+        },
+        {
+          "command": "archivePeek.openInViewer",
+          "when": "!explorerResourceIsFolder && (resourceExtname == .zip || resourceExtname == .7z || resourceExtname == .gz || resourceExtname == .bz2 || resourceExtname == .xz || resourceExtname == .tar || resourceExtname == .jar || resourceExtname == .war || resourceExtname == .ear || resourceExtname == .vsix || resourceExtname == .nupkg || resourceExtname == .apk || resourceExtname == .whl || resourceExtname == .xpi || resourceExtname == .epub || resourceExtname == .aar || resourceExtname == .rar || resourceExtname == .tgz || resourceExtname == .tbz2 || resourceExtname == .txz)",
+          "group": "navigation@21"
+        },
+        {
+          "command": "archivePeek.mountAsWorkspaceFolder",
+          "when": "!explorerResourceIsFolder && (resourceExtname == .zip || resourceExtname == .7z || resourceExtname == .gz || resourceExtname == .bz2 || resourceExtname == .xz || resourceExtname == .tar || resourceExtname == .jar || resourceExtname == .war || resourceExtname == .ear || resourceExtname == .vsix || resourceExtname == .nupkg || resourceExtname == .apk || resourceExtname == .whl || resourceExtname == .xpi || resourceExtname == .epub || resourceExtname == .aar || resourceExtname == .rar || resourceExtname == .tgz || resourceExtname == .tbz2 || resourceExtname == .txz)",
+          "group": "navigation@22"
+        },
+        {
+          "command": "archivePeek.unmountWorkspaceFolder",
+          "when": "explorerResourceIsRoot && resourceScheme == archive",
+          "group": "2_workspace@10"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "archivePeek.openInTree",
+          "when": "view == archivePeek.archives",
+          "group": "navigation@1"
+        },
+        {
+          "command": "archivePeek.tree.refreshAll",
+          "when": "view == archivePeek.archives && archivePeek.hasArchives",
+          "group": "navigation@2"
+        },
+        {
+          "command": "archivePeek.tree.closeAll",
+          "when": "view == archivePeek.archives && archivePeek.hasArchives",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "archivePeek.tree.refresh",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
+          "group": "inline@1"
+        },
+        {
+          "command": "archivePeek.tree.close",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
+          "group": "inline@2"
+        },
+        {
+          "command": "archivePeek.tree.open",
+          "when": "view == archivePeek.archives && viewItem == archivePeek.file",
+          "group": "1_open@1"
+        },
+        {
+          "command": "archivePeek.tree.openToSide",
+          "when": "view == archivePeek.archives && viewItem == archivePeek.file",
+          "group": "1_open@2"
+        },
+        {
+          "command": "archivePeek.tree.openInViewer",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
+          "group": "1_open@3"
+        },
+        {
+          "command": "archivePeek.tree.revealSource",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.(archive|file|directory)/",
+          "group": "2_reveal@1"
+        },
+        {
+          "command": "archivePeek.tree.copyPath",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.(archive|file|directory)/",
+          "group": "6_copypath@1"
+        },
+        {
+          "command": "archivePeek.tree.copyPathInArchive",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.(file|directory)$/",
+          "group": "6_copypath@2"
+        },
+        {
+          "command": "archivePeek.tree.refresh",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
+          "group": "7_manage@1"
+        },
+        {
+          "command": "archivePeek.tree.mount",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
+          "group": "7_manage@2"
+        },
+        {
+          "command": "archivePeek.tree.close",
+          "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
+          "group": "7_manage@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "archivePeek.unmountWorkspaceFolder",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.open",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.openToSide",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.openInViewer",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.refresh",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.close",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.copyPath",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.copyPathInArchive",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.revealSource",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.mount",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.retry",
+          "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.loadAnyway",
+          "when": "false"
         }
       ]
     },
@@ -182,6 +435,22 @@
           }
         ],
         "priority": "default"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "archivePeek.archives",
+          "name": "Archive Peek",
+          "icon": "$(file-zip)",
+          "contextualTitle": "Archive Peek"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "archivePeek.archives",
+        "contents": "Browse archives as read-only folders. Right-click an archive in the Explorer and choose **Open in Archive Peek View**, or pick one:\n[Open Archive…](command:archivePeek.openInTree)\nWorks with local archives and with archives on Remote SSH hosts. [Settings](command:workbench.action.openSettings?%5B%22archivePeek%22%5D)"
       }
     ]
   },

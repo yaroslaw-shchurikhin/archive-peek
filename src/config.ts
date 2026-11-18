@@ -24,3 +24,11 @@ export function archiveLimits(): ArchiveLimits {
     maxEntryBytes: getNumber('maxEntrySizeMB', 256) * MB
   };
 }
+
+/** How archives open from the Explorer (archivePeek.openMode). */
+export type OpenMode = 'viewer' | 'explorerTree';
+
+export function openMode(): OpenMode {
+  const value = vscode.workspace.getConfiguration('archivePeek').get<string>('openMode', 'viewer');
+  return value === 'explorerTree' ? 'explorerTree' : 'viewer';
+}
