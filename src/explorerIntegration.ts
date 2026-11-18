@@ -4,6 +4,7 @@ import { ARCHIVE_SCHEME, archiveEntryUri, archiveRootUri, decodeArchiveUri } fro
 import { ArchiveEditorProvider } from './archiveEditorProvider';
 import {
   ArchiveEntryElement,
+  ArchiveNode,
   ArchiveTreeElement,
   ArchiveTreeProvider,
   archiveLocation,
@@ -19,6 +20,7 @@ import {
   remoteLabel
 } from './archiveId';
 import { openMode } from './config';
+import { ArchiveDiscovery, workspaceRelativeLocation } from './archiveDiscovery';
 import { Logger, NULL_LOGGER } from './models';
 import { describeError } from './sourceErrors';
 import { archiveIdFromUri, uriFromArchiveId } from './vscodeFileAccess';
@@ -217,7 +219,8 @@ export function archiveIdOfTarget(target: CommandTarget): string | undefined {
     }
     return archiveIdFromUri(uri);
   }
-  return (target as ArchiveTreeElement).archiveId;
+  const element = target as ArchiveTreeElement;
+  return element.kind === 'group' || (element.kind === 'message' && !element.archiveId) ? undefined : element.archiveId;
 }
 
 export interface ExplorerIntegrationOptions {
@@ -242,16 +245,25 @@ export function registerExplorerIntegration(
 } {
   const { archiveManager, showLog } = options;
   const logger = options.logger ?? NULL_LOGGER;
-  const tree = new ArchiveTreeProvider(archiveManager, { state: options.state, logger });
+  // Created below; the tree asks it to search once it is shown
+  const discoveryRef: { current?: ArchiveDiscovery } = {};
+  const tree = new ArchiveTreeProvider(archiveManager, {
+    state: options.state,
+    logger,
+    relativeLocation: workspaceRelativeLocation,
+    onDidRequestDiscovery: () => discoveryRef.current?.request()
+  });
   const view = vscode.window.createTreeView(TREE_VIEW_ID, {
     treeDataProvider: tree,
     showCollapseAll: true,
     canSelectMany: false
   });
-  context.subscriptions.push(tree, view);
+  const discovery = new ArchiveDiscovery(tree, archiveManager, logger);
+  discoveryRef.current = discovery;
+  context.subscriptions.push(tree, view, discovery);
 
   const updateContext = () =>
-    void vscode.commands.executeCommand('setContext', 'archivePeek.hasArchives', tree.archives.length > 0);
+    void vscode.commands.executeCommand('setContext', 'archivePeek.hasArchives', tree.allArchives.length > 0);
   updateContext();
   context.subscriptions.push(tree.onDidChangeTreeData(updateContext));
 
@@ -346,7 +358,7 @@ export function registerExplorerIntegration(
 
   // ─── Tree commands ───────────────────────────────────────────────────
 
-  register('archivePeek.tree.open', async (element?: ArchiveTreeElement) => {
+  register('archivePeek.tree.open', async (element?: ArchiveNode) => {
     if (element?.kind === 'entry' && !element.isDirectory) {
       await vscode.commands.executeCommand('vscode.open', archiveEntryUri(element.archiveId, element.path), {
         preview: false
@@ -365,14 +377,14 @@ export function registerExplorerIntegration(
     }
   });
 
-  register('archivePeek.tree.openInViewer', async (element?: ArchiveTreeElement) => {
+  register('archivePeek.tree.openInViewer', async (element?: ArchiveNode) => {
     if (element) {
       await openInViewer(element.archiveId);
     }
   });
 
-  register('archivePeek.tree.refresh', async (element?: ArchiveTreeElement) => {
-    const ids = element ? [element.archiveId] : [...tree.archives];
+  register('archivePeek.tree.refresh', async (element?: ArchiveNode) => {
+    const ids = element ? [element.archiveId] : [...tree.allArchives];
     await vscode.window.withProgress({ location: { viewId: TREE_VIEW_ID }, title: 'Refreshing archives' }, async () => {
       for (const id of ids) {
         if (archiveManager.getArchive(id)) {
@@ -387,19 +399,46 @@ export function registerExplorerIntegration(
 
   register('archivePeek.tree.refreshAll', () => vscode.commands.executeCommand('archivePeek.tree.refresh'));
 
-  register('archivePeek.tree.close', (element?: ArchiveTreeElement) => {
+  register('archivePeek.tree.close', (element?: ArchiveNode) => {
     if (element) {
       closeInTree(element.archiveId);
     }
   });
 
-  register('archivePeek.tree.closeAll', () => {
+  register('archivePeek.tree.closeAll', async () => {
     for (const id of [...tree.archives]) {
       closeInTree(id);
     }
+    // Found archives stay listed; free the loaded ones and collapse them
+    for (const id of tree.discoveredArchives) {
+      if (archiveManager.getArchive(id) && !archiveInUse(id)) {
+        archiveManager.closeArchive(id);
+      }
+    }
+    await vscode.commands.executeCommand(`workbench.actions.treeView.${TREE_VIEW_ID}.collapseAll`);
   });
 
-  register('archivePeek.tree.copyPath', async (element?: ArchiveTreeElement) => {
+  register(TREE_COMMANDS.rescan, async () => {
+    if (!tree.discoveryState.enabled) {
+      return;
+    }
+    await discovery.scan({ resetHidden: true });
+  });
+
+  const setAutoDiscover = async (enabled: boolean) => {
+    // User settings only: a workspace setting would be written into the
+    // workspace's .vscode folder, which may be on the remote host.
+    await vscode.workspace
+      .getConfiguration('archivePeek.tree')
+      .update('autoDiscover', enabled, vscode.ConfigurationTarget.Global);
+    if (enabled) {
+      await vscode.commands.executeCommand(`${TREE_VIEW_ID}.focus`);
+    }
+  };
+  register('archivePeek.tree.enableAutoDiscover', () => setAutoDiscover(true));
+  register('archivePeek.tree.disableAutoDiscover', () => setAutoDiscover(false));
+
+  register('archivePeek.tree.copyPath', async (element?: ArchiveNode) => {
     if (!element) {
       return;
     }
@@ -408,13 +447,13 @@ export function registerExplorerIntegration(
     await vscode.env.clipboard.writeText(value);
   });
 
-  register('archivePeek.tree.copyPathInArchive', async (element?: ArchiveTreeElement) => {
+  register('archivePeek.tree.copyPathInArchive', async (element?: ArchiveNode) => {
     if (element?.kind === 'entry') {
       await vscode.env.clipboard.writeText(element.path);
     }
   });
 
-  register('archivePeek.tree.revealSource', async (element?: ArchiveTreeElement) => {
+  register('archivePeek.tree.revealSource', async (element?: ArchiveNode) => {
     if (!element) {
       return;
     }
@@ -437,7 +476,7 @@ export function registerExplorerIntegration(
     }
   });
 
-  register('archivePeek.tree.mount', async (element?: ArchiveTreeElement) => {
+  register('archivePeek.tree.mount', async (element?: ArchiveNode) => {
     if (element) {
       await mountArchive(element.archiveId);
     }

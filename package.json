@@ -2,7 +2,7 @@
   "name": "archive-peek-remote",
   "displayName": "Archive Peek (Remote SSH)",
   "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them, in a viewer or as expandable folders in the Explorer. Works with archives on Remote SSH hosts without installing anything on the server.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
@@ -58,6 +58,28 @@
             "Show archives as expandable read-only folders in the Archive Peek section of the Explorer side bar."
           ],
           "markdownDescription": "How archives open when you click them in the Explorer or run **Archive Peek: Open Archive**. The other mode stays available from the context menu (**Open in Archive Peek View** / **Open in Archive Viewer**)."
+        },
+        "archivePeek.tree.autoDiscover": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "List the archives found in the workspace folders in a **Found in Workspace** group of the Archive Peek section. The search runs once (when the section is shown) through VS Code's search service — on a Remote SSH host, the VS Code Server's own search; nothing is installed — and a file watcher keeps the list current. Archives are only listed; each one is read when you expand it."
+        },
+        "archivePeek.tree.autoDiscoverInclude": {
+          "type": "string",
+          "default": "**/*.{zip,7z,rar,tar,gz,tgz,bz2,tbz2,xz,txz,jar,war,ear,vsix,nupkg,apk,whl,xpi,epub,aar}",
+          "markdownDescription": "Glob pattern (relative to each workspace folder) of the archives to list, e.g. `**/reports/**/*.tar.gz`."
+        },
+        "archivePeek.tree.autoDiscoverExclude": {
+          "type": "string",
+          "default": "**/node_modules/**",
+          "markdownDescription": "Glob pattern of files and folders not to search. The enabled `#files.exclude#` patterns are always excluded as well."
+        },
+        "archivePeek.tree.autoDiscoverMaxResults": {
+          "type": "number",
+          "default": 200,
+          "minimum": 1,
+          "maximum": 10000,
+          "markdownDescription": "Maximum number of archives listed in **Found in Workspace**."
         },
         "archivePeek.autoRefresh": {
           "type": "boolean",
@@ -180,6 +202,24 @@
         "icon": "$(close-all)"
       },
       {
+        "command": "archivePeek.tree.rescan",
+        "title": "Rescan Workspace for Archives",
+        "category": "Archive Peek",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "archivePeek.tree.enableAutoDiscover",
+        "title": "Find Archives in Workspace",
+        "category": "Archive Peek",
+        "icon": "$(search)"
+      },
+      {
+        "command": "archivePeek.tree.disableAutoDiscover",
+        "title": "Stop Finding Archives in Workspace",
+        "category": "Archive Peek",
+        "icon": "$(search-stop)"
+      },
+      {
         "command": "archivePeek.tree.copyPath",
         "title": "Copy Path",
         "category": "Archive Peek"
@@ -249,6 +289,21 @@
           "command": "archivePeek.tree.closeAll",
           "when": "view == archivePeek.archives && archivePeek.hasArchives",
           "group": "navigation@3"
+        },
+        {
+          "command": "archivePeek.tree.enableAutoDiscover",
+          "when": "view == archivePeek.archives && !config.archivePeek.tree.autoDiscover",
+          "group": "1_discover@1"
+        },
+        {
+          "command": "archivePeek.tree.disableAutoDiscover",
+          "when": "view == archivePeek.archives && config.archivePeek.tree.autoDiscover",
+          "group": "1_discover@1"
+        },
+        {
+          "command": "archivePeek.tree.rescan",
+          "when": "view == archivePeek.archives && config.archivePeek.tree.autoDiscover",
+          "group": "1_discover@2"
         }
       ],
       "view/item/context": [
@@ -306,6 +361,21 @@
           "command": "archivePeek.tree.close",
           "when": "view == archivePeek.archives && viewItem =~ /^archivePeek\\.archive/",
           "group": "7_manage@3"
+        },
+        {
+          "command": "archivePeek.tree.rescan",
+          "when": "view == archivePeek.archives && viewItem == archivePeek.discoveredGroup",
+          "group": "inline@1"
+        },
+        {
+          "command": "archivePeek.tree.rescan",
+          "when": "view == archivePeek.archives && viewItem == archivePeek.discoveredGroup",
+          "group": "1_discover@1"
+        },
+        {
+          "command": "archivePeek.tree.disableAutoDiscover",
+          "when": "view == archivePeek.archives && viewItem == archivePeek.discoveredGroup",
+          "group": "1_discover@2"
         }
       ],
       "commandPalette": [
@@ -356,6 +426,10 @@
         {
           "command": "archivePeek.tree.loadAnyway",
           "when": "false"
+        },
+        {
+          "command": "archivePeek.tree.rescan",
+          "when": "config.archivePeek.tree.autoDiscover"
         }
       ]
     },
@@ -450,7 +524,7 @@
     "viewsWelcome": [
       {
         "view": "archivePeek.archives",
-        "contents": "Browse archives as read-only folders. Right-click an archive in the Explorer and choose **Open in Archive Peek View**, or pick one:\n[Open Archive…](command:archivePeek.openInTree)\nWorks with local archives and with archives on Remote SSH hosts. [Settings](command:workbench.action.openSettings?%5B%22archivePeek%22%5D)"
+        "contents": "Browse archives as read-only folders. Right-click an archive in the Explorer and choose **Open in Archive Peek View**, or pick one:\n[Open Archive…](command:archivePeek.openInTree)\nOr list all archives in the workspace here (only listed; each is read when you expand it):\n[Find Archives in Workspace](command:archivePeek.tree.enableAutoDiscover)\nWorks with local archives and with archives on Remote SSH hosts. [Settings](command:workbench.action.openSettings?%5B%22archivePeek%22%5D)"
       }
     ]
   },

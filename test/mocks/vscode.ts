@@ -141,10 +141,21 @@ export class EventEmitter<T> {
 }
 
 export class RelativePattern {
+  public readonly baseUri: URI;
   constructor(
-    public readonly baseUri: URI,
+    base: URI | { uri: URI },
     public readonly pattern: string
-  ) {}
+  ) {
+    this.baseUri = base instanceof URI ? base : (base as { uri: URI }).uri;
+  }
+}
+
+export class CancellationTokenSource {
+  token = { isCancellationRequested: false, onCancellationRequested: () => new Disposable() };
+  cancel(): void {
+    this.token.isCancellationRequested = true;
+  }
+  dispose(): void {}
 }
 
 export class TabInputText {
@@ -226,8 +237,12 @@ const configListeners = new EventEmitter<{ affectsConfiguration(key: string): bo
 /** Workspace folders; tests assign this directly. */
 export const workspaceState = {
   folders: undefined as { uri: URI; name: string; index: number }[] | undefined,
-  workspaceFile: undefined as URI | undefined
+  workspaceFile: undefined as URI | undefined,
+  /** Implementation of workspace.findFiles; tests replace it. */
+  findFiles: (async () => []) as (include: unknown, exclude?: unknown, maxResults?: number) => Promise<URI[]>,
+  findFilesCalls: [] as { include: unknown; exclude: unknown; maxResults?: number }[]
 };
+const workspaceFoldersChanged = new EventEmitter<unknown>();
 
 export const workspace = {
   textDocuments: [] as { uri: URI }[],
@@ -249,7 +264,13 @@ export const workspace = {
     const folders = [...(workspaceState.folders ?? [])];
     folders.splice(start, deleteCount, ...add.map((f) => ({ uri: f.uri, name: f.name ?? f.uri.path, index: 0 })));
     workspaceState.folders = folders.map((f, index) => ({ ...f, index }));
+    workspaceFoldersChanged.fire({});
     return true;
+  },
+  onDidChangeWorkspaceFolders: workspaceFoldersChanged.event,
+  async findFiles(include: unknown, exclude?: unknown, maxResults?: number) {
+    workspaceState.findFilesCalls.push({ include, exclude, maxResults });
+    return workspaceState.findFiles(include, exclude, maxResults);
   },
   fs: {
     async stat(uri: URI): Promise<FileStat> {

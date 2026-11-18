@@ -22,6 +22,9 @@ export const TREE_VIEW_ID = 'archivePeek.archives';
 /** workspaceState key holding the ids of the archives shown in the tree. */
 export const TREE_STATE_KEY = 'archivePeek.tree.archives';
 
+/** workspaceState key holding found archives the user closed (not shown again until a rescan). */
+export const TREE_HIDDEN_KEY = 'archivePeek.tree.hiddenDiscovered';
+
 /** An archive shown at the top level of the tree. */
 export interface ArchiveRootElement {
   readonly kind: 'archive';
@@ -48,7 +51,26 @@ export interface ArchiveMessageElement {
   readonly action?: { command: string; title: string };
 }
 
-export type ArchiveTreeElement = ArchiveRootElement | ArchiveEntryElement | ArchiveMessageElement;
+/** The "Found in Workspace" group holding archives found by archivePeek.tree.autoDiscover. */
+export interface DiscoveredGroupElement {
+  readonly kind: 'group';
+}
+
+export type ArchiveTreeElement =
+  ArchiveRootElement | ArchiveEntryElement | ArchiveMessageElement | DiscoveredGroupElement;
+
+/** Elements that belong to an archive (everything but the group). */
+export type ArchiveNode = ArchiveRootElement | ArchiveEntryElement | ArchiveMessageElement;
+
+/** State of the workspace search for archives. */
+export interface DiscoveryState {
+  enabled: boolean;
+  scanning: boolean;
+  /** More archives exist than archivePeek.tree.autoDiscoverMaxResults */
+  truncated: boolean;
+  /** Last search error, if any */
+  error?: string;
+}
 
 /** Storage for the list of archives (an ExtensionContext.workspaceState). */
 export interface TreeStateStore {
@@ -60,11 +82,16 @@ export interface ArchiveTreeOptions {
   /** Where the list of archives is persisted (per workspace). Archives are restored collapsed and not loaded. */
   state?: TreeStateStore;
   logger?: Logger;
+  /** Location of a found archive relative to the workspace (e.g. `project/reports`), shown as its description */
+  relativeLocation?: (archiveId: string) => string | undefined;
+  /** Called when the tree is first shown with discovery enabled, so the search runs only when needed */
+  onDidRequestDiscovery?: () => void;
 }
 
 /** Commands the tree items refer to (registered in extension.ts). */
 export const TREE_COMMANDS = {
   retry: 'archivePeek.tree.retry',
+  rescan: 'archivePeek.tree.rescan',
   loadAnyway: 'archivePeek.tree.loadAnyway',
   showLog: 'archivePeek.showLog'
 } as const;
@@ -95,6 +122,13 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
   readonly onDidChangeTreeData = this.emitter.event;
 
   private roots: string[] = [];
+  /** Archives found in the workspace (archivePeek.tree.autoDiscover), sorted for display */
+  private discovered: string[] = [];
+  /** Found archives the user closed; hidden until the next rescan */
+  private readonly hidden = new Set<string>();
+  private discovery: DiscoveryState = { enabled: false, scanning: false, truncated: false };
+  private discoveryRequested = false;
+  private readonly group: DiscoveredGroupElement = { kind: 'group' };
   /** Element objects by tree id, so the same element is returned every time (needed by TreeView.reveal) */
   private readonly elements = new Map<string, ArchiveRootElement | ArchiveEntryElement>();
   /** Load failures of archives that aren't loaded, shown instead of their contents */
@@ -116,8 +150,16 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
         }
       }
     }
+    const hidden = options.state?.get<unknown>(TREE_HIDDEN_KEY, []);
+    if (Array.isArray(hidden)) {
+      for (const id of hidden) {
+        if (typeof id === 'string') {
+          this.hidden.add(id);
+        }
+      }
+    }
     this.subscription = archiveManager.onDidChangeArchive((event) => {
-      if (!this.roots.includes(event.filePath)) {
+      if (!this.isShown(event.filePath)) {
         return;
       }
       if (event.type === 'opened' || event.type === 'changed') {
@@ -137,13 +179,42 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
     return this.roots;
   }
 
+  /** Found archives shown in the "Found in Workspace" group (excluding opened and hidden ones). */
+  get discoveredArchives(): readonly string[] {
+    return this.discovered.filter((id) => !this.roots.includes(id) && !this.hidden.has(id));
+  }
+
+  /** Every archive shown in the tree: opened ones, then found ones. */
+  get allArchives(): readonly string[] {
+    return [...this.roots, ...this.discoveredArchives];
+  }
+
+  get discoveryState(): Readonly<DiscoveryState> {
+    return this.discovery;
+  }
+
   has(archiveId: string): boolean {
     return this.roots.includes(normalizeArchiveId(archiveId));
+  }
+
+  /** True if the archive is shown in the tree, opened or found. */
+  isShown(archiveId: string): boolean {
+    const id = normalizeArchiveId(archiveId);
+    return this.roots.includes(id) || (this.discovered.includes(id) && !this.hidden.has(id));
+  }
+
+  /** True if the archive is shown in the "Found in Workspace" group. */
+  isDiscovered(archiveId: string): boolean {
+    const id = normalizeArchiveId(archiveId);
+    return !this.roots.includes(id) && this.discovered.includes(id) && !this.hidden.has(id);
   }
 
   /** Add an archive to the tree (without loading it) and return its node. */
   add(archiveId: string): ArchiveRootElement {
     const id = normalizeArchiveId(archiveId);
+    if (this.hidden.delete(id)) {
+      this.persistHidden();
+    }
     if (!this.roots.includes(id)) {
       this.roots.push(id);
       this.persist();
@@ -152,16 +223,25 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
     return this.rootElement(id);
   }
 
-  /** Remove an archive from the tree. Returns false if it wasn't there. */
+  /**
+   * Remove an archive from the tree. An archive found in the workspace is
+   * hidden until the next rescan. Returns false if it wasn't shown.
+   */
   remove(archiveId: string): boolean {
     const id = normalizeArchiveId(archiveId);
     const index = this.roots.indexOf(id);
-    if (index === -1) {
+    if (index !== -1) {
+      this.roots.splice(index, 1);
+      this.persist();
+    } else if (this.discovered.includes(id) && !this.hidden.has(id)) {
+      this.hidden.add(id);
+      this.persistHidden();
+    } else {
       return false;
     }
-    this.roots.splice(index, 1);
-    this.forget(id);
-    this.persist();
+    if (!this.isShown(id)) {
+      this.forget(id);
+    }
     this.emitter.fire();
     return true;
   }
@@ -170,8 +250,75 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
   retry(archiveId: string): void {
     const id = normalizeArchiveId(archiveId);
     this.errors.delete(id);
-    if (this.roots.includes(id)) {
+    if (this.isShown(id)) {
       this.emitter.fire(this.rootElement(id));
+    }
+  }
+
+  // ─── Archives found in the workspace ─────────────────────────────────
+
+  /** Turn the "Found in Workspace" group on or off. */
+  setDiscoveryEnabled(enabled: boolean): void {
+    if (this.discovery.enabled === enabled) {
+      return;
+    }
+    this.discovery = { enabled, scanning: false, truncated: false };
+    this.discoveryRequested = false;
+    if (!enabled) {
+      this.setDiscoveredIds([]);
+    }
+    this.emitter.fire();
+  }
+
+  /** Mark a search as running (shown in the group). */
+  setScanning(scanning: boolean, error?: string): void {
+    this.discovery = { ...this.discovery, scanning, error };
+    this.emitter.fire(this.discovery.enabled ? this.group : undefined);
+  }
+
+  /** Replace the found archives with the result of a search. Clears the hidden list when `resetHidden`. */
+  setDiscovered(ids: readonly string[], info: { truncated: boolean; resetHidden?: boolean }): void {
+    if (info.resetHidden && this.hidden.size > 0) {
+      this.hidden.clear();
+      this.persistHidden();
+    }
+    this.discovery = { ...this.discovery, scanning: false, truncated: info.truncated, error: undefined };
+    this.setDiscoveredIds(ids);
+    this.emitter.fire();
+  }
+
+  /** A matching archive was created in the workspace. */
+  addDiscovered(archiveId: string): void {
+    const id = normalizeArchiveId(archiveId);
+    if (!this.discovery.enabled || this.discovered.includes(id)) {
+      return;
+    }
+    this.setDiscoveredIds([...this.discovered, id]);
+    this.emitter.fire();
+  }
+
+  /** A found archive was deleted from the workspace. */
+  removeDiscovered(archiveId: string): void {
+    const id = normalizeArchiveId(archiveId);
+    if (!this.discovered.includes(id)) {
+      return;
+    }
+    this.setDiscoveredIds(this.discovered.filter((d) => d !== id));
+    this.emitter.fire();
+  }
+
+  private setDiscoveredIds(ids: readonly string[]): void {
+    const unique = [...new Set(ids.map((id) => normalizeArchiveId(id)))];
+    const key = (id: string) =>
+      (this.options.relativeLocation?.(id) ?? archivePathPart(id)) + '/' + archiveBaseName(id);
+    const keys = new Map(unique.map((id) => [id, key(id).toLowerCase()]));
+    unique.sort((a, b) => keys.get(a)!.localeCompare(keys.get(b)!));
+    const removed = this.discovered.filter((id) => !unique.includes(id));
+    this.discovered = unique;
+    for (const id of removed) {
+      if (!this.isShown(id)) {
+        this.forget(id);
+      }
     }
   }
 
@@ -211,6 +358,8 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
         return `e${SEP}${element.archiveId}${SEP}${element.path}`;
       case 'message':
         return `m${SEP}${element.archiveId}${SEP}${element.text}`;
+      case 'group':
+        return 'g';
     }
   }
 
@@ -224,12 +373,22 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
         return this.entryItem(element);
       case 'message':
         return this.messageItem(element);
+      case 'group':
+        return this.groupItem();
     }
   }
 
   async getChildren(element?: ArchiveTreeElement): Promise<ArchiveTreeElement[]> {
     if (!element) {
-      return this.roots.map((id) => this.rootElement(id));
+      const roots: ArchiveTreeElement[] = this.roots.map((id) => this.rootElement(id));
+      if (this.discovery.enabled) {
+        this.requestDiscovery();
+        roots.push(this.group);
+      }
+      return roots;
+    }
+    if (element.kind === 'group') {
+      return this.groupChildren();
     }
     if (element.kind === 'message' || (element.kind === 'entry' && !element.isDirectory)) {
       return [];
@@ -248,8 +407,14 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
   }
 
   getParent(element: ArchiveTreeElement): ArchiveTreeElement | undefined {
-    if (element.kind === 'archive') {
+    if (element.kind === 'group') {
       return undefined;
+    }
+    if (element.kind === 'archive') {
+      return this.isDiscovered(element.archiveId) ? this.group : undefined;
+    }
+    if (element.kind === 'message' && element.archiveId === '') {
+      return this.group;
     }
     if (element.kind === 'message') {
       return this.rootElement(element.archiveId);
@@ -261,7 +426,56 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
     return this.entryElement(element.archiveId, { path: element.path.slice(0, slash), isDirectory: true });
   }
 
+  private groupChildren(): ArchiveTreeElement[] {
+    this.requestDiscovery();
+    const found = this.discoveredArchives;
+    const items: ArchiveTreeElement[] = found.map((id) => this.rootElement(id));
+    const note = (text: string, severity: 'info' | 'error' = 'info', detail?: string): ArchiveMessageElement => ({
+      kind: 'message',
+      archiveId: '',
+      text,
+      detail,
+      severity,
+      action: severity === 'error' ? { command: TREE_COMMANDS.rescan, title: 'Rescan' } : undefined
+    });
+    if (this.discovery.error) {
+      items.push(note('Searching the workspace for archives failed.', 'error', this.discovery.error));
+    } else if (found.length === 0) {
+      items.push(
+        note(this.discovery.scanning ? 'Searching the workspace for archives…' : 'No archives found in the workspace.')
+      );
+    }
+    return items;
+  }
+
+  private requestDiscovery(): void {
+    if (this.discovery.enabled && !this.discoveryRequested) {
+      this.discoveryRequested = true;
+      this.options.onDidRequestDiscovery?.();
+    }
+  }
+
   // ─── Tree items ──────────────────────────────────────────────────────
+
+  private groupItem(): vscode.TreeItem {
+    const item = new vscode.TreeItem('Found in Workspace', vscode.TreeItemCollapsibleState.Expanded);
+    item.id = 'g';
+    item.iconPath = new vscode.ThemeIcon(this.discovery.scanning ? 'loading~spin' : 'search');
+    const count = this.discoveredArchives.length;
+    item.description = this.discovery.scanning
+      ? 'searching…'
+      : `${count}${this.discovery.truncated ? '+' : ''} ${count === 1 ? 'archive' : 'archives'}`;
+    item.tooltip = [
+      'Archives found in the workspace folders (setting "archivePeek.tree.autoDiscover").',
+      'They are listed only; an archive is read when you expand it.',
+      this.discovery.truncated ? 'Only the first results are shown (archivePeek.tree.autoDiscoverMaxResults).' : '',
+      this.hidden.size > 0 ? `${this.hidden.size} closed archive(s) are hidden until you rescan.` : ''
+    ]
+      .filter(Boolean)
+      .join('\n');
+    item.contextValue = 'archivePeek.discoveredGroup';
+    return item;
+  }
 
   private archiveItem(element: ArchiveRootElement): vscode.TreeItem {
     const id = element.archiveId;
@@ -270,7 +484,8 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
     // The archive's own URI: the file icon theme picks the archive icon, and
     // decorations of the source file (e.g. git status) are shown.
     item.resourceUri = uriFromArchiveId(id);
-    item.description = locationDescription(id);
+    const relative = this.isDiscovered(id) ? this.options.relativeLocation?.(id) : undefined;
+    item.description = relative ?? locationDescription(id);
     const archive = this.archiveManager.getArchive(id);
     const error = archive ? undefined : this.errors.get(id);
     item.iconPath = error ? new vscode.ThemeIcon('warning') : vscode.ThemeIcon.File;
@@ -284,7 +499,7 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
       lines.push(error.message);
     }
     item.tooltip = lines.join('\n');
-    item.contextValue = `archivePeek.archive${isRemoteId(id) ? '.remote' : '.local'}`;
+    item.contextValue = `archivePeek.archive${isRemoteId(id) ? '.remote' : '.local'}${this.isDiscovered(id) ? '.discovered' : ''}`;
     return item;
   }
 
@@ -387,7 +602,7 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
       this.logger.error(
         `Failed to open ${describeArchiveId(id, { redactHost: true })} in the tree [${kind}]: ${message}`
       );
-      if (this.roots.includes(id)) {
+      if (this.isShown(id)) {
         this.errors.set(id, { kind, message });
         // Update the archive node's icon and tooltip
         this.emitter.fire(this.rootElement(id));
@@ -406,6 +621,12 @@ export class ArchiveTreeProvider implements vscode.TreeDataProvider<ArchiveTreeE
         this.elements.delete(key);
       }
     }
+  }
+
+  private persistHidden(): void {
+    void Promise.resolve(this.options.state?.update(TREE_HIDDEN_KEY, [...this.hidden])).catch((error) =>
+      this.logger.warn(`Failed to save the list of hidden archives: ${String(error)}`)
+    );
   }
 
   private persist(): void {

@@ -7,7 +7,8 @@ Peek inside archive files directly in VS Code — without extracting them to dis
 > [Remote SSH Support](#remote-ssh-support).
 >
 > **Since 0.2.0 archives can also be browsed as expandable folders in the Explorer side bar** —
-> see [Explorer Integration](#explorer-integration).
+> see [Explorer Integration](#explorer-integration). **0.3.0** can list all archives of the
+> workspace there automatically (opt-in, [Found in Workspace](#found-in-workspace-optional)).
 
 ![Archive Peek screenshot](images/Screenshot.png)
 
@@ -73,6 +74,8 @@ To make clicking an archive open it in the Explorer tree instead of the viewer, 
 | `Archive Peek: Refresh Archives` | Re-read all opened archives and reload files opened from them |
 | `Archive Peek: Refresh All Archives` / `Close All Archives` | The same, for the archives in the Explorer tree |
 | `Archive Peek: Close Archive`    | Close an opened archive                    |
+| `Archive Peek: Find Archives in Workspace` / `Stop Finding Archives in Workspace` | Turn `archivePeek.tree.autoDiscover` on or off (user setting) |
+| `Archive Peek: Rescan Workspace for Archives` | Search the workspace again and show found archives you closed |
 | `Archive Peek: Show Log`         | Show the Archive Peek output channel |
 
 In the Archive Peek section, right-click an item for **Open**, **Open to the Side**, **Open in
@@ -85,6 +88,10 @@ Read-Only Folder** and **Close Archive**. Refresh and Close are also inline butt
 | Setting                  | Default | Description                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------------|
 | `archivePeek.openMode` | `viewer` | How archives open when clicked in the Explorer: `viewer` (editor tab) or `explorerTree` (expandable folder in the Archive Peek section of the Explorer). The other mode stays available from the context menu |
+| `archivePeek.tree.autoDiscover` | `false` | List the archives of the workspace folders in a **Found in Workspace** group of the Archive Peek section (see [Found in Workspace](#found-in-workspace-optional)) |
+| `archivePeek.tree.autoDiscoverInclude` | all supported extensions | Glob of the archives to list, relative to each workspace folder, e.g. `**/reports/**/*.tar.gz` |
+| `archivePeek.tree.autoDiscoverExclude` | `**/node_modules/**` | Glob of files and folders not to search; enabled `files.exclude` patterns are always excluded too |
+| `archivePeek.tree.autoDiscoverMaxResults` | `200` | Maximum number of archives listed |
 | `archivePeek.autoRefresh` | `true`  | Reload opened archives (and files opened from them) when they change on disk |
 | `archivePeek.remote.maxArchiveSizeMB` | `512` | Largest remote archive that is loaded (see [memory use](#memory-use-and-size-limit)). Larger archives show a warning with **Load Anyway** |
 | `archivePeek.remote.cacheSizeMB` | `2048` | Total size of local copies of remote archives kept in the OS temp directory (LRU) |
@@ -157,6 +164,41 @@ The three options from the public VS Code Extension API, in order of preference:
 - **Close Archive** frees the archive's memory and the local copy of a remote archive, unless the
   archive is still shown in a viewer tab, an editor, or as a workspace folder.
 
+### Found in Workspace (optional)
+
+By default only archives you open appear in the Archive Peek section. Turn on
+`archivePeek.tree.autoDiscover` (or click **Find Archives in Workspace** in the section's `…` menu or
+its welcome text) to also list every archive in the workspace folders in a **Found in Workspace**
+group:
+
+```
+ARCHIVE PEEK
+├── build.zip                      ~/Downloads            ← opened by you
+└── Found in Workspace             3 archives
+    ├── out.zip                    build
+    ├── post_check.tar.gz          reports
+    └── pre_check.tar.gz           reports
+```
+
+- **Cheap**: one `workspace.findFiles` query per workspace folder, run by VS Code's own search
+  service. In a Remote SSH window that is the VS Code Server on the host, with the ripgrep it
+  ships, over the existing connection. Nothing is installed or started by this extension.
+- **Lazy**: the search starts only once the section is shown, and found archives are only *listed*.
+  Nothing is read from an archive until you expand it.
+- **Current**: afterwards a file watcher on the same pattern adds new archives and removes deleted
+  ones. The workspace is searched again only on **Rescan**, when the settings change, or when
+  workspace folders are added or removed.
+- **Bounded**: `archivePeek.tree.autoDiscoverInclude` / `Exclude` restrict the search (the enabled
+  `files.exclude` patterns are always excluded), and at most
+  `archivePeek.tree.autoDiscoverMaxResults` archives are listed (`200+` means more exist).
+- Found archives show their folder relative to the workspace. **Close Archive** hides one until the
+  next **Rescan**. Opening one explicitly moves it to the top of the section.
+- Folders mounted from archives (`archive://`) are not searched. The setting is changed in the
+  *user* settings, never in the workspace's `.vscode/settings.json`, which may be on the remote host.
+
+On a very large remote workspace the first search can take a few seconds; narrow
+`autoDiscoverInclude` (e.g. `**/reports/**/*.tar.gz`) if needed.
+
 ### Performance
 
 The tree is a view over the existing machinery, not a second archive implementation: loading,
@@ -170,7 +212,8 @@ the same index serves the tree and the `archive://` file system.
   transfer.
 - File contents are read only when a file is opened (remote archives: from the local copy, after a
   single `stat` that checks the archive hasn't changed).
-- Nothing scans the workspace for archives; only archives the user opens are touched.
+- Nothing searches the workspace for archives unless `archivePeek.tree.autoDiscover` is on (see
+  above); otherwise only archives the user opens are touched.
 
 ### Limitations of the public API
 
@@ -326,11 +369,11 @@ possible but need correspondingly more free RAM during the transfer.
 The VSIX is built into `dist/`. Install it **into the local VS Code only** — never into the remote:
 
 ```bash
-code --install-extension dist/archive-peek-remote-0.2.0.vsix --force
+code --install-extension dist/archive-peek-remote-0.3.0.vsix --force
 ```
 
 (or Extensions view → `…` → **Install from VSIX…**, *in a local window*), then run
-**Developer: Reload Window**. 0.2.0 installs over 0.1.x (same identifier
+**Developer: Reload Window**. 0.3.0 installs over 0.1.x / 0.2.x (same identifier
 `local.archive-peek-remote`); settings and everything else carry over. Because of
 `extensionKind: ["ui"]`, VS Code runs it locally in Remote SSH windows; it does not offer to
 install it "in SSH: host" and you should not use **Install in SSH**.
