@@ -185,6 +185,7 @@ export interface FileStat {
 export interface MockFileSystemProvider {
   stat(uri: URI): FileStat | Promise<FileStat>;
   readFile(uri: URI): Uint8Array | Promise<Uint8Array>;
+  readDirectory?(uri: URI): [string, FileType][] | Promise<[string, FileType][]>;
 }
 
 const providers = new Map<string, MockFileSystemProvider>();
@@ -306,6 +307,24 @@ export const workspace = {
         throw FileSystemError.Unavailable(`No file system provider for scheme ${uri.scheme}`);
       }
       return provider.readFile(uri);
+    },
+    async readDirectory(uri: URI): Promise<[string, FileType][]> {
+      if (uri.scheme === 'file') {
+        try {
+          const entries = await nodeFs.promises.readdir(uri.fsPath, { withFileTypes: true });
+          return entries.map((e) => [
+            e.name,
+            e.isDirectory() ? FileType.Directory : e.isSymbolicLink() ? FileType.SymbolicLink : FileType.File
+          ]);
+        } catch (error) {
+          throw fromNodeError(error, uri);
+        }
+      }
+      const provider = providers.get(uri.scheme);
+      if (!provider?.readDirectory) {
+        throw FileSystemError.Unavailable(`No file system provider for scheme ${uri.scheme}`);
+      }
+      return provider.readDirectory(uri);
     }
   },
   registerFileSystemProvider(scheme: string, provider: MockFileSystemProvider) {

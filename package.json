@@ -2,7 +2,7 @@
   "name": "archive-peek-remote",
   "displayName": "Archive Peek (Remote SSH)",
   "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them, in a viewer or as expandable folders in the Explorer. Works with archives on Remote SSH hosts without installing anything on the server.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
@@ -88,6 +88,21 @@
           "minimum": 1,
           "maximum": 10000,
           "markdownDescription": "Maximum number of archives listed in **Found in Workspace**."
+        },
+        "archivePeek.tree.autoDiscoverMethod": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "search",
+            "walk"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "VS Code's search service for local and Remote SSH folders (falls back to listing folders if it doesn't answer within 30 s); listing folders for other file systems such as SFTP providers.",
+            "Always VS Code's search service. It never finishes for file systems without a search provider.",
+            "Always list folders through the file system provider (workspace.fs.readDirectory). Symbolic links to folders are not followed."
+          ],
+          "markdownDescription": "How **Found in Workspace** searches. VS Code can only search local and Remote SSH folders; for other file systems (e.g. third-party SFTP extensions) folders are listed one by one instead."
         },
         "archivePeek.autoRefresh": {
           "type": "boolean",

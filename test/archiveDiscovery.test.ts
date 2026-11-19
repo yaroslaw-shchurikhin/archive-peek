@@ -33,7 +33,7 @@ import {
   workspaceRelativeLocation
 } from '../src/archiveDiscovery';
 import { FakeRemoteFileSystemProvider } from './fakeRemoteFileSystemProvider';
-import { buildTarGz, NESTED_FILES } from './remoteFixtures';
+import { buildTarGz, buildZip, NESTED_FILES } from './remoteFixtures';
 
 const MB = 1024 * 1024;
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -52,7 +52,8 @@ describe('discovery settings', () => {
       include: DEFAULT_INCLUDE,
       exclude: '**/node_modules/**',
       maxResults: 200,
-      folders: []
+      folders: [],
+      method: 'auto'
     });
     expect(DEFAULT_INCLUDE).toContain('gz');
     expect(DEFAULT_INCLUDE).toContain('tgz');
@@ -424,5 +425,166 @@ describe('Found in Workspace (archivePeek.tree.autoDiscover)', () => {
     workspaceState.folders = [folder];
     expect(workspaceRelativeLocation(id('/srv/project/a.zip'))).toBe('.');
     expect(workspaceRelativeLocation(id('/elsewhere/a.zip'))).toBeUndefined();
+  });
+});
+
+describe('Found in Workspace on file systems without a search provider (e.g. SFTP extensions)', () => {
+  let sftp: FakeRemoteFileSystemProvider;
+  let registration: { dispose(): void };
+  let tmpBase: string;
+  let cache: RemoteArchiveCache;
+  let manager: ArchiveManager;
+  let tree: ArchiveTreeProvider;
+  let discovery: ArchiveDiscovery;
+  let logs: string[];
+
+  beforeEach(async () => {
+    sftp = new FakeRemoteFileSystemProvider('acme-ssh.Xy7Qa2Lm', 'acme-sftp');
+    registration = vscode.workspace.registerFileSystemProvider(
+      'acme-sftp',
+      sftp as unknown as vscode.FileSystemProvider
+    );
+    tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'archive-peek-walk-'));
+    cache = new RemoteArchiveCache(new VscodeRemoteFileAccess(), {
+      baseDir: tmpBase,
+      maxArchiveBytes: () => 512 * MB,
+      maxCacheBytes: () => 2048 * MB
+    });
+    manager = new ArchiveManager({ remote: cache });
+    logs = [];
+
+    // An embedded device's root file system, opened at /
+    const data = await buildTarGz(NESTED_FILES);
+    sftp.setFile('/tmp/work/var/reports/pre_check.tar.gz', data);
+    sftp.setFile('/tmp/work/var/reports/post_check.tar.gz', data);
+    sftp.setFile('/tmp/work/bin/service', 'binary');
+    sftp.setFile('/opt/other/elsewhere.tar.gz', data);
+    sftp.setFile('/usr/lib/libz.so', 'lib');
+    sftp.setFile('/proc/1/status', 'pid 1');
+    sftp.setFile('/lib/loop/x.tar.gz', data);
+    sftp.linkDir('/lib');
+    workspaceState.folders = [{ uri: sftp.uri('/'), name: 'device-root', index: 0 }];
+    workspaceState.findFilesCalls.length = 0;
+    // What VS Code does for a scheme without a search provider: never answer
+    workspaceState.findFiles = () => new Promise<URI[]>(() => {});
+    configuration['archivePeek.tree.autoDiscover'] = true;
+  });
+
+  afterEach(() => {
+    discovery?.dispose();
+    tree?.dispose();
+    cache.dispose();
+    registration.dispose();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+    workspaceState.folders = undefined;
+    workspaceState.findFiles = async () => [];
+    for (const key of Object.keys(configuration)) {
+      delete configuration[key];
+    }
+    expect(sftp.writeCalls).toBe(0);
+  });
+
+  function create(limits = { searchTimeoutMs: 50, maxFolders: 1000, maxDepth: 32, concurrency: 4 }) {
+    tree = new ArchiveTreeProvider(manager, { onDidRequestDiscovery: () => discovery.request() });
+    const logger = {
+      trace() {},
+      info: (m: string) => logs.push(m),
+      warn: (m: string) => logs.push(m),
+      error: (m: string) => logs.push(m)
+    };
+    discovery = new ArchiveDiscovery(tree, manager, logger, undefined, () => ({}), limits);
+  }
+
+  async function found(): Promise<string[]> {
+    const roots = await tree.getChildren();
+    const group = roots.find((r) => r.kind === 'group')!;
+    return (await tree.getChildren(group)).map((e) => tree.getTreeItem(e).label as string);
+  }
+
+  it('lists folders through the provider instead of waiting for a search that never ends', async () => {
+    configuration['archivePeek.tree.autoDiscoverFolders'] = ['/tmp/work'];
+    create();
+    await discovery.scan();
+    expect(workspaceState.findFilesCalls).toHaveLength(0);
+    expect(await found()).toEqual(['post_check.tar.gz', 'pre_check.tar.gz']);
+    expect(tree.discoveryState.scanning).toBe(false);
+    // Only the configured subtree was listed: work, bin, var, var/reports
+    expect(sftp.readDirectoryCalls).toBe(4);
+    expect(sftp.readFileCalls).toBe(0);
+    expect(logs.join('\n')).toMatch(
+      /No search service for "acme-sftp:" folders; listing folders of acme-sftp:\/\/…\/tmp\/work/
+    );
+    expect(logs.join('\n')).toMatch(/Listed 4 folder\(s\) .* 2 match\(es\)/);
+  });
+
+  it('from /, skips /proc and does not follow symbolic links to folders', async () => {
+    create();
+    await discovery.scan();
+    expect(await found()).toEqual(['elsewhere.tar.gz', 'post_check.tar.gz', 'pre_check.tar.gz']);
+    expect(logs.join('\n')).not.toMatch(/\/proc/);
+  });
+
+  it('honours the include pattern with the folder path (as configured on the device)', async () => {
+    configuration['archivePeek.tree.autoDiscoverFolders'] = ['/tmp/work'];
+    configuration['archivePeek.tree.autoDiscoverInclude'] =
+      'tmp/work/**/*.{tar.gz,tgz,tar,tar.xz,txz,tar.bz2,tbz2,gz,zip}';
+    create();
+    await discovery.scan();
+    expect(await found()).toEqual(['post_check.tar.gz', 'pre_check.tar.gz']);
+  });
+
+  it('marks the list as incomplete when the folder limit is reached', async () => {
+    create({ searchTimeoutMs: 50, maxFolders: 2, maxDepth: 32, concurrency: 1 });
+    await discovery.scan();
+    expect(tree.discoveryState.truncated).toBe(true);
+    expect(logs.join('\n')).toMatch(/stopped at the folders limit/);
+  });
+
+  it('shows an error when the folder cannot be listed at all', async () => {
+    configuration['archivePeek.tree.autoDiscoverFolders'] = ['/opt/missing'];
+    create();
+    await discovery.scan();
+    const roots = await tree.getChildren();
+    const [message] = (await tree.getChildren(roots[0])) as ArchiveMessageElement[];
+    expect(message.severity).toBe('error');
+    expect(tree.discoveryState.error).toMatch(/Cannot list/);
+  });
+
+  it('falls back to listing folders when the search service does not answer in time (Remote SSH)', async () => {
+    const ssh = new FakeRemoteFileSystemProvider();
+    const reg = vscode.workspace.registerFileSystemProvider(
+      'vscode-remote',
+      ssh as unknown as vscode.FileSystemProvider
+    );
+    try {
+      ssh.setFile('/srv/app/out/build.zip', buildZip({ 'a.txt': 'a' }));
+      workspaceState.folders = [{ uri: ssh.uri('/srv/app'), name: 'app', index: 0 }];
+      create();
+      await discovery.scan();
+      expect(workspaceState.findFilesCalls).toHaveLength(1);
+      expect(await found()).toEqual(['build.zip']);
+      expect(logs.join('\n')).toMatch(/did not answer within 0 s; listing folders instead/);
+    } finally {
+      reg.dispose();
+    }
+  });
+
+  it('can be forced to list folders (archivePeek.tree.autoDiscoverMethod = walk)', async () => {
+    const ssh = new FakeRemoteFileSystemProvider();
+    const reg = vscode.workspace.registerFileSystemProvider(
+      'vscode-remote',
+      ssh as unknown as vscode.FileSystemProvider
+    );
+    try {
+      ssh.setFile('/srv/app/build.zip', buildZip({ 'a.txt': 'a' }));
+      workspaceState.folders = [{ uri: ssh.uri('/srv/app'), name: 'app', index: 0 }];
+      configuration['archivePeek.tree.autoDiscoverMethod'] = 'walk';
+      create();
+      await discovery.scan();
+      expect(workspaceState.findFilesCalls).toHaveLength(0);
+      expect(await found()).toEqual(['build.zip']);
+    } finally {
+      reg.dispose();
+    }
   });
 });

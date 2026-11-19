@@ -93,6 +93,7 @@ Read-Only Folder** and **Close Archive**. Refresh and Close are also inline butt
 | `archivePeek.tree.autoDiscoverInclude` | all supported extensions | Glob of the archives to list, relative to each searched folder, e.g. `**/*.tar.gz` |
 | `archivePeek.tree.autoDiscoverExclude` | `**/node_modules/**` | Glob of files and folders not to search; enabled `files.exclude` patterns are always excluded too |
 | `archivePeek.tree.autoDiscoverMaxResults` | `200` | Maximum number of archives listed |
+| `archivePeek.tree.autoDiscoverMethod` | `auto` | `auto`: VS Code's search for local and Remote SSH folders, folder listing for other file systems (e.g. SFTP extensions); `search` / `walk` force one of them |
 | `archivePeek.autoRefresh` | `true`  | Reload opened archives (and files opened from them) when they change on disk |
 | `archivePeek.remote.maxArchiveSizeMB` | `512` | Largest remote archive that is loaded (see [memory use](#memory-use-and-size-limit)). Larger archives show a warning with **Load Anyway** |
 | `archivePeek.remote.cacheSizeMB` | `2048` | Total size of local copies of remote archives kept in the OS temp directory (LRU) |
@@ -181,9 +182,16 @@ ARCHIVE PEEK
     └── pre_check.tar.gz           reports
 ```
 
-- **Cheap**: one `workspace.findFiles` query per workspace folder, run by VS Code's own search
-  service. In a Remote SSH window that is the VS Code Server on the host, with the ripgrep it
-  ships, over the existing connection. Nothing is installed or started by this extension.
+- **Cheap**: for local and Remote SSH folders, one `workspace.findFiles` query per searched folder,
+  run by VS Code's own search service (in a Remote SSH window: the VS Code Server on the host, with
+  the ripgrep it ships, over the existing connection). If it doesn't answer within 30 s, folders are
+  listed instead. Nothing is installed or started by this extension.
+- **Other file systems** (third-party SFTP/SSH extensions whose window shows `remote window: none`
+  in the log): VS Code can't search them — `findFiles` would wait forever, since only proposed APIs
+  can provide a search for them. Folders are listed one by one with `workspace.fs.readDirectory`
+  through the same provider the Explorer uses: no symbolic links to folders are followed (embedded
+  root file systems often link `/lib`, `/bin`…), and the walk stops after 20,000 folders or 32
+  levels. Narrow it with `autoDiscoverFolders`.
 - **Lazy**: the search starts only once the section is shown, and found archives are only *listed*.
   Nothing is read from an archive until you expand it.
 - **Current**: afterwards a file watcher on the same pattern adds new archives and removes deleted
@@ -389,11 +397,11 @@ possible but need correspondingly more free RAM during the transfer.
 The VSIX is built into `dist/`. Install it **into the local VS Code only** — never into the remote:
 
 ```bash
-code --install-extension dist/archive-peek-remote-0.3.2.vsix --force
+code --install-extension dist/archive-peek-remote-0.3.3.vsix --force
 ```
 
 (or Extensions view → `…` → **Install from VSIX…**, *in a local window*), then run
-**Developer: Reload Window**. 0.3.2 installs over 0.1.x – 0.3.1 (same identifier
+**Developer: Reload Window**. 0.3.3 installs over 0.1.x – 0.3.2 (same identifier
 `local.archive-peek-remote`); settings and everything else carry over. Because of
 `extensionKind: ["ui"]`, VS Code runs it locally in Remote SSH windows; it does not offer to
 install it "in SSH: host" and you should not use **Install in SSH**.

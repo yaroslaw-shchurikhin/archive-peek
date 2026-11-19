@@ -22,6 +22,9 @@ interface FakeFile {
 export class FakeRemoteFileSystemProvider {
   private files = new Map<string, FakeFile>();
   private denied = new Set<string>();
+  /** Folders reported as symbolic links (Directory | SymbolicLink), e.g. a link back to / */
+  private links = new Set<string>();
+  readDirectoryCalls = 0;
   private changeEmitter = new EventEmitter<{ type: FileChangeType; uri: URI }[]>();
   readonly onDidChangeFile = this.changeEmitter.event;
 
@@ -124,8 +127,36 @@ export class FakeRemoteFileSystemProvider {
     return new Uint8Array(file.data);
   }
 
-  readDirectory(): [string, FileType][] {
-    return [];
+  readDirectory(uri: URI): [string, FileType][] {
+    this.readDirectoryCalls++;
+    this.check(uri);
+    const prefix = uri.path === '/' ? '/' : `${uri.path.replace(/\/$/, '')}/`;
+    const entries = new Map<string, FileType>();
+    for (const p of this.files.keys()) {
+      if (!p.startsWith(prefix)) {
+        continue;
+      }
+      const rest = p.slice(prefix.length);
+      const slash = rest.indexOf('/');
+      const name = slash === -1 ? rest : rest.slice(0, slash);
+      const childPath = prefix + name;
+      const type =
+        slash === -1
+          ? FileType.File
+          : this.links.has(childPath)
+            ? FileType.Directory | FileType.SymbolicLink
+            : FileType.Directory;
+      entries.set(name, type);
+    }
+    if (entries.size === 0 && !this.files.has(uri.path) && uri.path !== '/') {
+      throw FileSystemError.FileNotFound(uri);
+    }
+    return [...entries];
+  }
+
+  /** Report a folder as a symbolic link to a folder. */
+  linkDir(path: string): void {
+    this.links.add(path);
   }
 
   writeFile(): void {

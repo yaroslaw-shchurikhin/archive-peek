@@ -6,6 +6,7 @@ import { describeArchiveId } from './archiveId';
 import { Logger, NULL_LOGGER } from './models';
 import { describeError } from './sourceErrors';
 import { archiveIdFromUri, uriFromArchiveId } from './vscodeFileAccess';
+import { globToRegExp, walkFolders } from './folderWalker';
 
 export const AUTO_DISCOVER_SETTING = 'archivePeek.tree.autoDiscover';
 
@@ -37,6 +38,31 @@ export const DEFAULT_INCLUDE = `**/*.{${ARCHIVE_EXTENSIONS.join(',')}}`;
 export const DEFAULT_EXCLUDE = '**/node_modules/**';
 export const DEFAULT_MAX_RESULTS = 200;
 
+/** How the workspace is searched (archivePeek.tree.autoDiscoverMethod). */
+export type DiscoveryMethod = 'auto' | 'search' | 'walk';
+
+/**
+ * Schemes whose files VS Code's search service can search (`workspace.findFiles`).
+ * For other schemes findFiles waits for a search provider that never comes,
+ * so their folders are listed with readDirectory instead.
+ */
+const SEARCHABLE_SCHEMES = new Set(['file', 'vscode-remote', 'vscode-userdata']);
+
+export interface DiscoveryLimits {
+  /** findFiles time limit before falling back to listing folders (method "auto") */
+  searchTimeoutMs: number;
+  maxFolders: number;
+  maxDepth: number;
+  concurrency: number;
+}
+
+export const DEFAULT_DISCOVERY_LIMITS: DiscoveryLimits = {
+  searchTimeoutMs: 30_000,
+  maxFolders: 20_000,
+  maxDepth: 32,
+  concurrency: 8
+};
+
 export interface DiscoverySettings {
   enabled: boolean;
   include: string;
@@ -44,6 +70,7 @@ export interface DiscoverySettings {
   maxResults: number;
   /** Folders to search instead of the workspace folders (absolute on the workspace's host, or relative to each workspace folder) */
   folders: string[];
+  method: DiscoveryMethod;
 }
 
 export function readDiscoverySettings(): DiscoverySettings {
@@ -52,6 +79,7 @@ export function readDiscoverySettings(): DiscoverySettings {
   const exclude = config.get<string>('autoDiscoverExclude', DEFAULT_EXCLUDE);
   const max = config.get<number>('autoDiscoverMaxResults', DEFAULT_MAX_RESULTS);
   const folders = config.get<unknown>('autoDiscoverFolders', []);
+  const method = config.get<string>('autoDiscoverMethod', 'auto');
   return {
     enabled: config.get<boolean>('autoDiscover', false) === true,
     include: typeof include === 'string' && include.trim() ? include.trim() : DEFAULT_INCLUDE,
@@ -62,7 +90,8 @@ export function readDiscoverySettings(): DiscoverySettings {
         : DEFAULT_MAX_RESULTS,
     folders: Array.isArray(folders)
       ? folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '').map((f) => f.trim())
-      : []
+      : [],
+    method: method === 'search' || method === 'walk' ? method : 'auto'
   };
 }
 
@@ -173,6 +202,19 @@ export function buildExcludePattern(
   filesExclude: Record<string, unknown> | undefined,
   extra: readonly string[] = []
 ): string | undefined {
+  const patterns = excludeList(exclude, filesExclude, extra);
+  if (patterns.length === 0) {
+    return undefined;
+  }
+  return patterns.length === 1 ? patterns[0] : `{${patterns.join(',')}}`;
+}
+
+/** The exclude patterns as a list (setting, extra excludes, enabled files.exclude entries). */
+export function excludeList(
+  exclude: string,
+  filesExclude: Record<string, unknown> | undefined,
+  extra: readonly string[] = []
+): string[] {
   const patterns = new Set<string>();
   if (exclude) {
     patterns.add(exclude);
@@ -186,10 +228,7 @@ export function buildExcludePattern(
       patterns.add(pattern);
     }
   }
-  if (patterns.size === 0) {
-    return undefined;
-  }
-  return patterns.size === 1 ? [...patterns][0] : `{${[...patterns].join(',')}}`;
+  return [...patterns];
 }
 
 /** The VS Code calls discovery needs (replaced in tests). */
@@ -202,10 +241,12 @@ export interface DiscoveryHost {
     token: vscode.CancellationToken
   ): Thenable<vscode.Uri[]>;
   createWatcher(pattern: vscode.GlobPattern): vscode.FileSystemWatcher;
+  readDirectory(uri: vscode.Uri): Thenable<[string, vscode.FileType][]>;
 }
 
 const defaultHost: DiscoveryHost = {
   workspaceFolders: () => vscode.workspace.workspaceFolders ?? [],
+  readDirectory: (uri) => vscode.workspace.fs.readDirectory(uri),
   findFiles: (include, exclude, maxResults, token) => vscode.workspace.findFiles(include, exclude, maxResults, token),
   createWatcher: (pattern) => vscode.workspace.createFileSystemWatcher(pattern, false, true, false)
 };
@@ -214,10 +255,17 @@ const defaultHost: DiscoveryHost = {
  * Finds archives in the workspace folders for the "Found in Workspace" group
  * (opt-in: archivePeek.tree.autoDiscover).
  *
- * - One `workspace.findFiles` query per workspace folder, run by VS Code's
- *   search service — for a Remote SSH folder, by the VS Code Server on the
- *   host, with the ripgrep it ships. Nothing is installed or started by this
- *   extension, and no extra connection is opened.
+ * - `file:` and Remote SSH (`vscode-remote:`) folders: one
+ *   `workspace.findFiles` query per searched folder, run by VS Code's search
+ *   service — for Remote SSH, by the VS Code Server on the host with the
+ *   ripgrep it ships. If it doesn't answer within 30 s, folders are listed instead.
+ * - Other file systems (e.g. third-party SFTP providers): VS Code has no
+ *   search for them (findFiles would wait forever), so folders are listed with
+ *   `workspace.fs.readDirectory` through the same provider the Explorer uses —
+ *   without following symbolic links to folders, and bounded by depth and
+ *   number of folders (see folderWalker.ts).
+ * - Nothing is installed or started by this extension, and no extra
+ *   connection is opened.
  * - Archives are only listed. Nothing is read until an archive is expanded.
  * - Then a file watcher on the same pattern keeps the list current, so the
  *   workspace is not searched again (except on Rescan, when the settings or
@@ -242,7 +290,8 @@ export class ArchiveDiscovery implements vscode.Disposable {
     private readonly logger: Logger = NULL_LOGGER,
     private readonly host: DiscoveryHost = defaultHost,
     private readonly filesExclude: () => Record<string, unknown> | undefined = () =>
-      vscode.workspace.getConfiguration('files').get<Record<string, unknown>>('exclude')
+      vscode.workspace.getConfiguration('files').get<Record<string, unknown>>('exclude'),
+    private readonly limits: DiscoveryLimits = DEFAULT_DISCOVERY_LIMITS
   ) {
     this.settings = readDiscoverySettings();
     tree.setDiscoveryEnabled(this.settings.enabled);
@@ -317,6 +366,7 @@ export class ArchiveDiscovery implements vscode.Disposable {
     const started = Date.now();
     const found: string[] = [];
     let truncated = false;
+    this.walkTruncated = false;
     try {
       for (const root of roots) {
         const remaining = maxResults - found.length;
@@ -324,14 +374,8 @@ export class ArchiveDiscovery implements vscode.Disposable {
           truncated = true;
           break;
         }
-        const rootExclude = buildExcludePattern(this.settings.exclude, filesExclude, root.extraExclude);
         // One more than needed tells whether the list is cut off
-        const uris = await this.host.findFiles(
-          new vscode.RelativePattern(root.base, root.pattern),
-          rootExclude,
-          remaining + 1,
-          cancel.token
-        );
+        const uris = await this.findInRoot(root, remaining + 1, filesExclude, cancel.token, generation);
         if (generation !== this.generation) {
           return;
         }
@@ -355,9 +399,96 @@ export class ArchiveDiscovery implements vscode.Disposable {
       `Found ${found.length}${truncated ? '+' : ''} archive(s) in ${roots.length} folder(s) in ${Date.now() - started} ms` +
         ` (${roots.map((r) => describeArchiveId(archiveIdFromUri(r.base), { redactHost: true })).join(', ')})`
     );
+    truncated ||= this.walkTruncated;
     this.tree.setDiscovered(found, { truncated, resetHidden: options.resetHidden });
     this.watch(roots);
   }
+
+  /**
+   * Find matching files below one search root: with VS Code's search service
+   * where it can search the scheme, otherwise (or if it doesn't answer in
+   * time) by listing folders.
+   */
+  private async findInRoot(
+    root: SearchRoot,
+    maxResults: number,
+    filesExclude: Record<string, unknown> | undefined,
+    token: vscode.CancellationToken,
+    generation: number
+  ): Promise<vscode.Uri[]> {
+    const where = describeArchiveId(archiveIdFromUri(root.base), { redactHost: true });
+    const method = this.settings.method;
+    const searchable = SEARCHABLE_SCHEMES.has(root.base.scheme);
+    if (method === 'search' || (method === 'auto' && searchable)) {
+      this.logger.info(`Searching ${where} for "${root.pattern}" with VS Code's search service`);
+      const search = Promise.resolve(
+        this.host.findFiles(
+          new vscode.RelativePattern(root.base, root.pattern),
+          buildExcludePattern(this.settings.exclude, filesExclude, root.extraExclude),
+          maxResults,
+          token
+        )
+      );
+      if (method === 'search') {
+        return search;
+      }
+      const timeout = Symbol('timeout');
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        search,
+        new Promise<typeof timeout>((resolve) => {
+          timer = setTimeout(() => resolve(timeout), this.limits.searchTimeoutMs);
+        })
+      ]).finally(() => clearTimeout(timer));
+      if (outcome !== timeout) {
+        return outcome;
+      }
+      search.catch(() => undefined);
+      this.logger.warn(
+        `VS Code's search service did not answer within ${Math.round(this.limits.searchTimeoutMs / 1000)} s; listing folders instead`
+      );
+    } else if (method === 'auto') {
+      this.logger.info(
+        `No search service for "${root.base.scheme}:" folders; listing folders of ${where} for "${root.pattern}"`
+      );
+    } else {
+      this.logger.info(`Listing folders of ${where} for "${root.pattern}"`);
+    }
+
+    const started = Date.now();
+    const result = await walkFolders(
+      (relative) =>
+        this.host.readDirectory(relative ? vscode.Uri.joinPath(root.base, ...relative.split('/')) : root.base),
+      {
+        include: root.pattern,
+        exclude: excludeList(this.settings.exclude, filesExclude, root.extraExclude),
+        maxResults,
+        maxFolders: this.limits.maxFolders,
+        maxDepth: this.limits.maxDepth,
+        concurrency: this.limits.concurrency,
+        isCancelled: () => generation !== this.generation || token.isCancellationRequested
+      }
+    );
+    this.logger.info(
+      `Listed ${result.foldersListed} folder(s) of ${where} in ${Date.now() - started} ms, ${result.matches.length} match(es)` +
+        (result.limit && result.limit !== 'results' ? `; stopped at the ${result.limit} limit` : '') +
+        (result.errorCount
+          ? `; ${result.errorCount} folder(s) could not be listed, e.g. ${result.errors[0].path}: ${result.errors[0].message}`
+          : '')
+    );
+    if (result.foldersListed === result.errorCount && result.errorCount > 0) {
+      throw new Error(`Cannot list ${where}: ${result.errors[0].message}`);
+    }
+    const matches = result.matches.map((relative) => vscode.Uri.joinPath(root.base, ...relative.split('/')));
+    if (result.limit === 'folders' || result.limit === 'depth') {
+      // More archives may exist below the folders that weren't listed
+      this.walkTruncated = true;
+    }
+    return matches;
+  }
+
+  /** Set when a folder walk stopped at a folder/depth limit. */
+  private walkTruncated = false;
 
   /** Keep the list current from file events instead of searching again. */
   private watch(roots: readonly SearchRoot[]): void {
@@ -388,11 +519,14 @@ export class ArchiveDiscovery implements vscode.Disposable {
   private isExcluded(uri: vscode.Uri, base: vscode.Uri): boolean {
     const basePath = base.path.replace(/\/$/, '');
     const relative = uri.path.startsWith(basePath + '/') ? uri.path.slice(basePath.length + 1) : uri.path;
-    const exclude = this.settings.exclude;
-    // Common case: "**/<dir>/**"
-    const dirMatch = /^\*\*\/([^*{}/]+)\/\*\*$/.exec(exclude);
-    if (dirMatch) {
-      return relative.split('/').slice(0, -1).includes(dirMatch[1]);
+    const patterns = excludeList(this.settings.exclude, this.filesExclude()).map(globToRegExp);
+    const parts = relative.split('/');
+    // Excluded if the file or any of its folders matches
+    for (let n = 1; n <= parts.length; n++) {
+      const prefix = parts.slice(0, n).join('/');
+      if (patterns.some((re) => re.test(prefix))) {
+        return true;
+      }
     }
     return false;
   }
