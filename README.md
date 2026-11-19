@@ -198,6 +198,9 @@ ARCHIVE PEEK
   folder it starts in. A literal leading path in the include pattern
   (`tmp/work/**/*.tar.gz`) is therefore turned into the start folder, and a search
   that starts at `/` skips `/proc`, `/sys`, `/dev` and `/run`.
+  The include pattern is relative to the folder it searches. If it starts with that folder's own
+  path (folder `/tmp/work`, pattern `tmp/work/**/*.tar.gz`),
+  the path is not added a second time (the Output channel notes this).
 - Found archives show their folder relative to the workspace. **Close Archive** hides one until the
   next **Rescan**. Opening one explicitly moves it to the top of the section.
 - Folders mounted from archives (`archive://`) are not searched. The setting is changed in the
@@ -386,11 +389,11 @@ possible but need correspondingly more free RAM during the transfer.
 The VSIX is built into `dist/`. Install it **into the local VS Code only** — never into the remote:
 
 ```bash
-code --install-extension dist/archive-peek-remote-0.3.1.vsix --force
+code --install-extension dist/archive-peek-remote-0.3.2.vsix --force
 ```
 
 (or Extensions view → `…` → **Install from VSIX…**, *in a local window*), then run
-**Developer: Reload Window**. 0.3.1 installs over 0.1.x – 0.3.0 (same identifier
+**Developer: Reload Window**. 0.3.2 installs over 0.1.x – 0.3.1 (same identifier
 `local.archive-peek-remote`); settings and everything else carry over. Because of
 `extensionKind: ["ui"]`, VS Code runs it locally in Remote SSH windows; it does not offer to
 install it "in SSH: host" and you should not use **Install in SSH**.

@@ -2,7 +2,7 @@
   "name": "archive-peek-remote",
   "displayName": "Archive Peek (Remote SSH)",
   "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them, in a viewer or as expandable folders in the Explorer. Works with archives on Remote SSH hosts without installing anything on the server.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
@@ -75,7 +75,7 @@
         "archivePeek.tree.autoDiscoverInclude": {
           "type": "string",
           "default": "**/*.{zip,7z,rar,tar,gz,tgz,bz2,tbz2,xz,txz,jar,war,ear,vsix,nupkg,apk,whl,xpi,epub,aar}",
-          "markdownDescription": "Glob pattern of the archives to list, relative to each searched folder (`#archivePeek.tree.autoDiscoverFolders#`, or the workspace folders), e.g. `**/*.tar.gz`. A leading literal path such as `tmp/work/**/*.tar.gz` makes the search start in that folder."
+          "markdownDescription": "Glob pattern of the archives to list, relative to each searched folder (`#archivePeek.tree.autoDiscoverFolders#`, or the workspace folders), e.g. `**/*.tar.gz`. A leading literal path such as `tmp/work/**/*.tar.gz` makes the search start in that folder. If the pattern starts with the searched folder's own path (folder `/opt/app`, pattern `opt/app/**/*.tgz`), that path is not added a second time."
         },
         "archivePeek.tree.autoDiscoverExclude": {
           "type": "string",

@@ -81,6 +81,41 @@ describe('discovery settings', () => {
     expect(r.extraExclude).toBeUndefined();
   });
 
+  it('does not append the folder path twice when the pattern repeats it', () => {
+    const host = [{ uri: URI.from({ scheme: 'vscode-remote', authority: 'ssh-remote+Host-A', path: '/' }) }];
+    const include = 'tmp/work/**/*.{tar.gz,tgz,tar,tar.xz,txz,tar.bz2,tbz2,gz,zip}';
+
+    const [same] = computeSearchRoots(host as never, { include, folders: ['/tmp/work'] });
+    expect(same.base.path).toBe('/tmp/work');
+    expect(same.base.authority).toBe('ssh-remote+Host-A');
+    expect(same.pattern).toBe('**/*.{tar.gz,tgz,tar,tar.xz,txz,tar.bz2,tbz2,gz,zip}');
+    expect(same.repeatedPath).toBe(true);
+
+    // A deeper path inside the folder narrows the search to it
+    const [deeper] = computeSearchRoots(host as never, {
+      include: 'tmp/work/var/reports/*.tar.gz',
+      folders: ['/tmp/work/']
+    });
+    expect(deeper.base.path).toBe('/tmp/work/var/reports');
+    expect(deeper.pattern).toBe('*.tar.gz');
+
+    // Also with a leading slash, and for a workspace folder opened at that path
+    const [slash] = computeSearchRoots(
+      [{ uri: URI.from({ scheme: 'vscode-remote', authority: 'ssh-remote+h', path: '/tmp/work' }) }] as never,
+      { include: '/tmp/work/**/*.tgz', folders: [] }
+    );
+    expect(slash.base.path).toBe('/tmp/work');
+    expect(slash.pattern).toBe('**/*.tgz');
+
+    // A relative path that is not the folder's own path is still appended
+    const [relative] = computeSearchRoots(host as never, {
+      include: 'var/reports/**/*.tgz',
+      folders: ['/tmp/work']
+    });
+    expect(relative.base.path).toBe('/tmp/work/var/reports');
+    expect(relative.repeatedPath).toBeUndefined();
+  });
+
   it('skips /proc, /sys, /dev and /run when searching from the file system root', () => {
     const root = [{ uri: URI.from({ scheme: 'vscode-remote', authority: 'ssh-remote+h', path: '/' }) }];
     const [r] = computeSearchRoots(root as never, { include: DEFAULT_INCLUDE, folders: [] });

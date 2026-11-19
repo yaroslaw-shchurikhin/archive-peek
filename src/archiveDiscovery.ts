@@ -74,6 +74,11 @@ export interface SearchRoot {
   pattern: string;
   /** Extra excludes for this root (pseudo file systems when searching from `/`) */
   extraExclude?: readonly string[];
+  /**
+   * The include pattern started with the search folder's own path (e.g.
+   * folder `/opt/app`, pattern `opt/app/**\/*.tgz`), which was not appended again.
+   */
+  repeatedPath?: boolean;
 }
 
 /** Linux pseudo file systems that must not be walked when searching from `/`. */
@@ -125,19 +130,34 @@ export function computeSearchRoots(
   }
 
   // Move the literal leading segments of the pattern into the base folder
-  const segments = settings.include.replace(/^\.\//, '').split('/');
+  const segments = settings.include.replace(/^\.?\/+/, '').split('/');
   const firstGlob = segments.findIndex((segment) => GLOB_CHARS.test(segment));
   const literal = firstGlob > 0 ? segments.slice(0, firstGlob) : [];
   const pattern = literal.length > 0 ? segments.slice(firstGlob).join('/') : settings.include;
 
   const roots = new Map<string, SearchRoot>();
   for (const base of bases) {
-    const root = literal.length > 0 ? vscode.Uri.joinPath(base, ...literal) : base;
+    let root = base;
+    let repeatedPath = false;
+    if (literal.length > 0) {
+      // A pattern written from the file system root ("opt/app/…") for a folder
+      // that already is /opt/app (or a parent of the literal path): use that
+      // path as is instead of appending it to the folder a second time.
+      const basePath = base.path.replace(/\/+$/, '');
+      const fromRoot = '/' + literal.join('/');
+      if (basePath !== '' && (fromRoot === basePath || fromRoot.startsWith(basePath + '/'))) {
+        root = base.with({ path: fromRoot });
+        repeatedPath = true;
+      } else {
+        root = vscode.Uri.joinPath(base, ...literal);
+      }
+    }
     roots.set(root.toString(), {
       base: root,
       pattern,
       // Unix file system root: don't walk pseudo file systems (harmless where they don't exist)
-      extraExclude: root.path === '/' ? ROOT_PSEUDO_EXCLUDE : undefined
+      extraExclude: root.path === '/' ? ROOT_PSEUDO_EXCLUDE : undefined,
+      repeatedPath: repeatedPath || undefined
     });
   }
   return [...roots.values()];
@@ -287,6 +307,12 @@ export class ArchiveDiscovery implements vscode.Disposable {
     const { maxResults } = this.settings;
     const filesExclude = this.filesExclude();
     const roots = computeSearchRoots(this.host.workspaceFolders(), this.settings);
+    for (const root of roots.filter((r) => r.repeatedPath)) {
+      this.logger.info(
+        `archivePeek.tree.autoDiscoverInclude starts with the path of the searched folder; searching ` +
+          `${describeArchiveId(archiveIdFromUri(root.base), { redactHost: true })} for "${root.pattern}"`
+      );
+    }
     this.tree.setScanning(true);
     const started = Date.now();
     const found: string[] = [];
