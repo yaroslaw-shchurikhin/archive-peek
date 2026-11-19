@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -53,7 +53,8 @@ describe('discovery settings', () => {
       exclude: '**/node_modules/**',
       maxResults: 200,
       folders: [],
-      method: 'auto'
+      method: 'auto',
+      rescanInterval: 0
     });
     expect(DEFAULT_INCLUDE).toContain('gz');
     expect(DEFAULT_INCLUDE).toContain('tgz');
@@ -68,6 +69,17 @@ describe('discovery settings', () => {
     expect(settings.enabled).toBe(true);
     expect(settings.include).toBe(DEFAULT_INCLUDE);
     expect(settings.maxResults).toBe(200);
+  });
+
+  it('raises a rescan interval below 10 s to 10 s and treats 0 or invalid values as off', () => {
+    configuration['archivePeek.tree.autoDiscoverRescanInterval'] = 3;
+    expect(readDiscoverySettings().rescanInterval).toBe(10);
+    configuration['archivePeek.tree.autoDiscoverRescanInterval'] = 60;
+    expect(readDiscoverySettings().rescanInterval).toBe(60);
+    configuration['archivePeek.tree.autoDiscoverRescanInterval'] = 0;
+    expect(readDiscoverySettings().rescanInterval).toBe(0);
+    configuration['archivePeek.tree.autoDiscoverRescanInterval'] = -1;
+    expect(readDiscoverySettings().rescanInterval).toBe(0);
   });
 
   it('starts the search in the literal leading folder of the include pattern', () => {
@@ -586,5 +598,110 @@ describe('Found in Workspace on file systems without a search provider (e.g. SFT
     } finally {
       reg.dispose();
     }
+  });
+
+  describe('automatic rescan (archivePeek.tree.autoDiscoverRescanInterval)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      configuration['archivePeek.tree.autoDiscoverFolders'] = ['/tmp/work'];
+      configuration['archivePeek.tree.autoDiscoverRescanInterval'] = 30;
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const REPORTS = '/tmp/work/var/reports';
+
+    it('searches again every N seconds and updates the list (no file events on SFTP)', async () => {
+      create();
+      await discovery.scan();
+      expect(await found()).toEqual(['post_check.tar.gz', 'pre_check.tar.gz']);
+      const listed = sftp.readDirectoryCalls;
+
+      sftp.removeFile(`${REPORTS}/pre_check.tar.gz`);
+      sftp.setFile(`${REPORTS}/fresh.tgz`, 'x');
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(sftp.readDirectoryCalls).toBe(listed);
+      expect(await found()).toEqual(['post_check.tar.gz', 'pre_check.tar.gz']);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sftp.readDirectoryCalls).toBe(listed * 2);
+      expect(await found()).toEqual(['fresh.tgz', 'post_check.tar.gz']);
+      expect(logs.join('\n')).toMatch(/Automatic rescan: 1 new, 1 removed archive\(s\)/);
+      // Search steps of automatic rescans are not logged at info level
+      expect(logs.filter((l) => l.startsWith('Listed '))).toHaveLength(1);
+      expect(sftp.readFileCalls).toBe(0);
+
+      // And keeps going
+      sftp.removeFile(`${REPORTS}/fresh.tgz`);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await found()).toEqual(['post_check.tar.gz']);
+    });
+
+    it('does not touch the tree when nothing changed', async () => {
+      create();
+      await discovery.scan();
+      let changes = 0;
+      tree.onDidChangeTreeData(() => changes++);
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(sftp.readDirectoryCalls).toBe(4 * 4);
+      expect(changes).toBe(0);
+      expect(logs.join('\n')).not.toMatch(/Automatic rescan/);
+    });
+
+    it('waits while the section is hidden and searches when it is shown again', async () => {
+      create();
+      await discovery.scan();
+      discovery.setVisible(false);
+      sftp.setFile(`${REPORTS}/fresh.tgz`, 'x');
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(sftp.readDirectoryCalls).toBe(4);
+
+      discovery.setVisible(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sftp.readDirectoryCalls).toBe(8);
+      expect(await found()).toContain('fresh.tgz');
+    });
+
+    it('keeps the list when a rescan fails and logs the error once', async () => {
+      create();
+      await discovery.scan();
+      sftp.deny('/tmp/work');
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(await found()).toEqual(['post_check.tar.gz', 'pre_check.tar.gz']);
+      expect(tree.discoveryState.error).toBeUndefined();
+      expect(logs.filter((l) => l.startsWith('Automatic rescan for archives failed'))).toHaveLength(1);
+
+      // Recovers on the next rescan
+      sftp.allow('/tmp/work');
+      sftp.setFile(`${REPORTS}/fresh.tgz`, 'x');
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await found()).toContain('fresh.tgz');
+    });
+
+    it('is off with 0, and changing only the interval does not search immediately', async () => {
+      configuration['archivePeek.tree.autoDiscoverRescanInterval'] = 0;
+      create();
+      await discovery.scan();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(sftp.readDirectoryCalls).toBe(4);
+
+      configuration['archivePeek.tree.autoDiscoverRescanInterval'] = 20;
+      discovery.applySettings(readDiscoverySettings());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sftp.readDirectoryCalls).toBe(4);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(sftp.readDirectoryCalls).toBe(8);
+    });
+
+    it('stops when discovery is turned off', async () => {
+      create();
+      await discovery.scan();
+      configuration['archivePeek.tree.autoDiscover'] = false;
+      discovery.applySettings(readDiscoverySettings());
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(sftp.readDirectoryCalls).toBe(4);
+    });
   });
 });

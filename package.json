@@ -2,7 +2,7 @@
   "name": "archive-peek-remote",
   "displayName": "Archive Peek (Remote SSH)",
   "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them, in a viewer or as expandable folders in the Explorer. Works with archives on Remote SSH hosts without installing anything on the server.",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
@@ -103,6 +103,13 @@
             "Always list folders through the file system provider (workspace.fs.readDirectory). Symbolic links to folders are not followed."
           ],
           "markdownDescription": "How **Found in Workspace** searches. VS Code can only search local and Remote SSH folders; for other file systems (e.g. third-party SFTP extensions) folders are listed one by one instead."
+        },
+        "archivePeek.tree.autoDiscoverRescanInterval": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 86400,
+          "markdownDescription": "Search the workspace for archives again every this many seconds (`0` = off). Useful when archives come and go on file systems that send no file events, such as SFTP extensions. Values below 10 are raised to 10. The next search starts when the previous one has finished, and none runs while the Archive Peek section is hidden. The list is updated only if it changed."
         },
         "archivePeek.autoRefresh": {
           "type": "boolean",

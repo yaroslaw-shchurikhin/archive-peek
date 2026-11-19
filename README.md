@@ -93,6 +93,7 @@ Read-Only Folder** and **Close Archive**. Refresh and Close are also inline butt
 | `archivePeek.tree.autoDiscoverInclude` | all supported extensions | Glob of the archives to list, relative to each searched folder, e.g. `**/*.tar.gz` |
 | `archivePeek.tree.autoDiscoverExclude` | `**/node_modules/**` | Glob of files and folders not to search; enabled `files.exclude` patterns are always excluded too |
 | `archivePeek.tree.autoDiscoverMaxResults` | `200` | Maximum number of archives listed |
+| `archivePeek.tree.autoDiscoverRescanInterval` | `0` | Search again every this many seconds (`0` = off, minimum 10); for file systems without file events |
 | `archivePeek.tree.autoDiscoverMethod` | `auto` | `auto`: VS Code's search for local and Remote SSH folders, folder listing for other file systems (e.g. SFTP extensions); `search` / `walk` force one of them |
 | `archivePeek.autoRefresh` | `true`  | Reload opened archives (and files opened from them) when they change on disk |
 | `archivePeek.remote.maxArchiveSizeMB` | `512` | Largest remote archive that is loaded (see [memory use](#memory-use-and-size-limit)). Larger archives show a warning with **Load Anyway** |
@@ -197,6 +198,15 @@ ARCHIVE PEEK
 - **Current**: afterwards a file watcher on the same pattern adds new archives and removes deleted
   ones. The workspace is searched again only on **Rescan**, when the settings change, or when
   workspace folders are added or removed.
+- **Automatic rescan** (optional): file systems that send no file events (many SFTP extensions)
+  never tell the watcher about new or deleted archives. Set
+  `archivePeek.tree.autoDiscoverRescanInterval` to search again every N seconds (at least 10).
+  - The next search starts only after the previous one has finished, so slow searches never pile up.
+  - While the Archive Peek section is hidden (collapsed, or the sidebar closed), nothing is
+    searched; one search runs as soon as it is shown again.
+  - The list stays on screen during a rescan and is updated only if it changed. The Output channel
+    logs only the changes (`Automatic rescan: 1 new, 1 removed archive(s); …`).
+  - A failed rescan, for example while the host is unreachable, keeps the list and logs the error once.
 - **Bounded**: `archivePeek.tree.autoDiscoverInclude` / `Exclude` restrict the search (the enabled
   `files.exclude` patterns are always excluded), and at most
   `archivePeek.tree.autoDiscoverMaxResults` archives are listed (`200+` means more exist).
@@ -217,11 +227,13 @@ ARCHIVE PEEK
 **Example**: a Remote SSH window with `/` open, archives only under `/tmp/work`
 (and its subfolders), at most 100:
 
-```json
+```jsonc
 "archivePeek.tree.autoDiscover": true,
 "archivePeek.tree.autoDiscoverFolders": ["/tmp/work"],
 "archivePeek.tree.autoDiscoverInclude": "**/*.{tar.gz,tgz,tar,tar.xz,txz,tar.bz2,tbz2,gz,zip}",
-"archivePeek.tree.autoDiscoverMaxResults": 100
+"archivePeek.tree.autoDiscoverMaxResults": 100,
+// Optional: search again every minute, e.g. when the folder is on an SFTP file system
+"archivePeek.tree.autoDiscoverRescanInterval": 60
 ```
 
 Without `autoDiscoverFolders`, a workspace opened at `/` is searched as a whole (minus the pseudo
@@ -397,11 +409,11 @@ possible but need correspondingly more free RAM during the transfer.
 The VSIX is built into `dist/`. Install it **into the local VS Code only** — never into the remote:
 
 ```bash
-code --install-extension dist/archive-peek-remote-0.3.3.vsix --force
+code --install-extension dist/archive-peek-remote-0.4.0.vsix --force
 ```
 
 (or Extensions view → `…` → **Install from VSIX…**, *in a local window*), then run
-**Developer: Reload Window**. 0.3.3 installs over 0.1.x – 0.3.2 (same identifier
+**Developer: Reload Window**. 0.4.0 installs over 0.1.x – 0.3.3 (same identifier
 `local.archive-peek-remote`); settings and everything else carry over. Because of
 `extensionKind: ["ui"]`, VS Code runs it locally in Remote SSH windows; it does not offer to
 install it "in SSH: host" and you should not use **Install in SSH**.

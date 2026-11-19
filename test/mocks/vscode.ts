@@ -357,6 +357,14 @@ export const createdTreeViews: MockTreeView[] = [];
 
 export class MockTreeView {
   revealed: { element: unknown; options: unknown }[] = [];
+  visible = true;
+  private readonly visibility = new EventEmitter<{ visible: boolean }>();
+  readonly onDidChangeVisibility = this.visibility.event;
+  /** Emulate showing or hiding the view (collapsing the section, closing the sidebar). */
+  setVisible(visible: boolean): void {
+    this.visible = visible;
+    this.visibility.fire({ visible });
+  }
   constructor(
     public readonly id: string,
     public readonly options: { treeDataProvider: unknown }

@@ -37,6 +37,10 @@ export const ARCHIVE_EXTENSIONS = [
 export const DEFAULT_INCLUDE = `**/*.{${ARCHIVE_EXTENSIONS.join(',')}}`;
 export const DEFAULT_EXCLUDE = '**/node_modules/**';
 export const DEFAULT_MAX_RESULTS = 200;
+/** Shortest automatic rescan interval, in seconds (shorter values are raised to it). */
+export const MIN_RESCAN_INTERVAL = 10;
+/** Longest automatic rescan interval, in seconds (one day). */
+const MAX_RESCAN_INTERVAL = 86_400;
 
 /** How the workspace is searched (archivePeek.tree.autoDiscoverMethod). */
 export type DiscoveryMethod = 'auto' | 'search' | 'walk';
@@ -71,6 +75,8 @@ export interface DiscoverySettings {
   /** Folders to search instead of the workspace folders (absolute on the workspace's host, or relative to each workspace folder) */
   folders: string[];
   method: DiscoveryMethod;
+  /** Search again every this many seconds; 0 = only on Rescan, setting or folder changes */
+  rescanInterval: number;
 }
 
 export function readDiscoverySettings(): DiscoverySettings {
@@ -80,6 +86,7 @@ export function readDiscoverySettings(): DiscoverySettings {
   const max = config.get<number>('autoDiscoverMaxResults', DEFAULT_MAX_RESULTS);
   const folders = config.get<unknown>('autoDiscoverFolders', []);
   const method = config.get<string>('autoDiscoverMethod', 'auto');
+  const interval = config.get<number>('autoDiscoverRescanInterval', 0);
   return {
     enabled: config.get<boolean>('autoDiscover', false) === true,
     include: typeof include === 'string' && include.trim() ? include.trim() : DEFAULT_INCLUDE,
@@ -91,7 +98,11 @@ export function readDiscoverySettings(): DiscoverySettings {
     folders: Array.isArray(folders)
       ? folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '').map((f) => f.trim())
       : [],
-    method: method === 'search' || method === 'walk' ? method : 'auto'
+    method: method === 'search' || method === 'walk' ? method : 'auto',
+    rescanInterval:
+      typeof interval === 'number' && Number.isFinite(interval) && interval > 0
+        ? Math.min(Math.max(Math.round(interval), MIN_RESCAN_INTERVAL), MAX_RESCAN_INTERVAL)
+        : 0
   };
 }
 
@@ -270,6 +281,10 @@ const defaultHost: DiscoveryHost = {
  * - Then a file watcher on the same pattern keeps the list current, so the
  *   workspace is not searched again (except on Rescan, when the settings or
  *   the workspace folders change).
+ * - Optionally (archivePeek.tree.autoDiscoverRescanInterval) it searches again
+ *   every N seconds, for file systems that send no file events (SFTP
+ *   providers). The next search is timed from the end of the previous one, so
+ *   searches never overlap, and it waits while the section is hidden.
  * - The search only starts once the Archive Peek section is shown.
  * - Folders mounted from archives (archive://) are skipped.
  */
@@ -283,6 +298,14 @@ export class ArchiveDiscovery implements vscode.Disposable {
   private requested = false;
   /** True once a search ran for the current settings */
   private started = false;
+  /** Timer of the next automatic rescan */
+  private rescanTimer?: NodeJS.Timeout;
+  /** The automatic rescan came due while the section was hidden */
+  private rescanDue = false;
+  /** Whether the Archive Peek section is visible (automatic rescans wait while it is not) */
+  private visible = true;
+  /** Last error of an automatic rescan, so the same one is not logged every time */
+  private lastPeriodicError?: string;
 
   constructor(
     private readonly tree: ArchiveTreeProvider,
@@ -317,11 +340,26 @@ export class ArchiveDiscovery implements vscode.Disposable {
     }
   }
 
+  /** The Archive Peek section was shown or hidden. */
+  setVisible(visible: boolean): void {
+    this.visible = visible;
+    if (visible && this.rescanDue) {
+      this.rescanDue = false;
+      void this.scan({ periodic: true });
+    }
+  }
+
   /** Apply changed settings: start, stop or rerun the search. */
   applySettings(settings: DiscoverySettings, options: { force?: boolean } = {}): void {
-    const changed = JSON.stringify(settings) !== JSON.stringify(this.settings);
+    const searchKey = (s: DiscoverySettings) => JSON.stringify({ ...s, rescanInterval: undefined });
+    const changed = searchKey(settings) !== searchKey(this.settings);
+    const intervalChanged = settings.rescanInterval !== this.settings.rescanInterval;
     this.settings = settings;
     if (!changed && !(options.force && settings.enabled && this.started)) {
+      if (intervalChanged && this.started) {
+        // Only the rescan interval changed: no need to search again now
+        this.scheduleRescan();
+      }
       return;
     }
     this.started = false;
@@ -339,30 +377,54 @@ export class ArchiveDiscovery implements vscode.Disposable {
 
   /**
    * Search the workspace folders. `resetHidden` (Rescan) also shows found
-   * archives the user closed before.
+   * archives the user closed before. `periodic` (automatic rescan) keeps the
+   * current list on screen while searching, updates it only if it changed, and
+   * logs only the changes.
    */
-  async scan(options: { resetHidden?: boolean } = {}): Promise<void> {
+  async scan(options: { resetHidden?: boolean; periodic?: boolean } = {}): Promise<void> {
     if (!this.settings.enabled) {
       return;
     }
     this.started = true;
     const generation = ++this.generation;
+    this.clearRescanTimer();
     this.cancel?.cancel();
     this.cancel?.dispose();
     const cancel = new vscode.CancellationTokenSource();
     this.cancel = cancel;
-    this.disposeWatchers();
+    try {
+      await this.runScan(generation, cancel.token, options);
+    } finally {
+      if (generation === this.generation) {
+        this.scheduleRescan();
+      }
+    }
+  }
+
+  private async runScan(
+    generation: number,
+    token: vscode.CancellationToken,
+    options: { resetHidden?: boolean; periodic?: boolean }
+  ): Promise<void> {
+    const periodic = options.periodic === true;
+    // Automatic rescans log the search steps at trace level only
+    const log = periodic ? (m: string) => this.logger.trace(m) : (m: string) => this.logger.info(m);
+    if (!periodic) {
+      this.disposeWatchers();
+    }
 
     const { maxResults } = this.settings;
     const filesExclude = this.filesExclude();
     const roots = computeSearchRoots(this.host.workspaceFolders(), this.settings);
     for (const root of roots.filter((r) => r.repeatedPath)) {
-      this.logger.info(
+      log(
         `archivePeek.tree.autoDiscoverInclude starts with the path of the searched folder; searching ` +
           `${describeArchiveId(archiveIdFromUri(root.base), { redactHost: true })} for "${root.pattern}"`
       );
     }
-    this.tree.setScanning(true);
+    if (!periodic) {
+      this.tree.setScanning(true);
+    }
     const started = Date.now();
     const found: string[] = [];
     let truncated = false;
@@ -375,7 +437,7 @@ export class ArchiveDiscovery implements vscode.Disposable {
           break;
         }
         // One more than needed tells whether the list is cut off
-        const uris = await this.findInRoot(root, remaining + 1, filesExclude, cancel.token, generation);
+        const uris = await this.findInRoot(root, remaining + 1, filesExclude, token, generation, log);
         if (generation !== this.generation) {
           return;
         }
@@ -390,18 +452,84 @@ export class ArchiveDiscovery implements vscode.Disposable {
         return;
       }
       const { message } = describeError(error);
+      if (periodic) {
+        // Keep the list (the host may be briefly unreachable); log each new error once
+        if (message !== this.lastPeriodicError) {
+          this.logger.warn(`Automatic rescan for archives failed: ${message}`);
+        }
+        this.lastPeriodicError = message;
+        return;
+      }
       this.logger.warn(`Searching the workspace for archives failed: ${message}`);
       this.tree.setScanning(false, message);
       return;
     }
+    this.lastPeriodicError = undefined;
 
-    this.logger.info(
+    log(
       `Found ${found.length}${truncated ? '+' : ''} archive(s) in ${roots.length} folder(s) in ${Date.now() - started} ms` +
         ` (${roots.map((r) => describeArchiveId(archiveIdFromUri(r.base), { redactHost: true })).join(', ')})`
     );
     truncated ||= this.walkTruncated;
+    if (periodic) {
+      this.applyRescan(found, truncated);
+      if (this.watchers.length === 0) {
+        this.watch(roots);
+      }
+      return;
+    }
     this.tree.setDiscovered(found, { truncated, resetHidden: options.resetHidden });
     this.watch(roots);
+  }
+
+  /** Update the list after an automatic rescan, only if something changed. */
+  private applyRescan(found: readonly string[], truncated: boolean): void {
+    const before = new Set(this.tree.discoveredArchives);
+    const now = new Set(found);
+    const added = found.filter((id) => !before.has(id));
+    const removed = [...before].filter((id) => !now.has(id));
+    if (added.length === 0 && removed.length === 0 && truncated === this.tree.discoveryState.truncated) {
+      return;
+    }
+    const describe = (ids: readonly string[]) =>
+      ids
+        .slice(0, 5)
+        .map((id) => describeArchiveId(id, { redactHost: true }))
+        .join(', ') + (ids.length > 5 ? `, … (${ids.length})` : '');
+    this.logger.info(
+      `Automatic rescan: ${added.length} new, ${removed.length} removed archive(s)` +
+        (added.length ? `; new: ${describe(added)}` : '') +
+        (removed.length ? `; removed: ${describe(removed)}` : '')
+    );
+    this.tree.setDiscovered(found, { truncated });
+  }
+
+  /** Time the next automatic rescan from now (archivePeek.tree.autoDiscoverRescanInterval). */
+  private scheduleRescan(): void {
+    this.clearRescanTimer();
+    const seconds = this.settings.rescanInterval;
+    if (!this.settings.enabled || !this.started || seconds <= 0) {
+      return;
+    }
+    this.rescanTimer = setTimeout(() => {
+      this.rescanTimer = undefined;
+      if (this.visible) {
+        void this.scan({ periodic: true });
+      } else {
+        // Search once the section is shown again
+        this.rescanDue = true;
+      }
+    }, seconds * 1000);
+    // Don't keep a process alive for this timer (tests, shutdown)
+    this.rescanTimer.unref?.();
+  }
+
+  private clearRescanTimer(): void {
+    if (this.rescanTimer) {
+      clearTimeout(this.rescanTimer);
+      this.rescanTimer = undefined;
+    }
+    this.rescanDue = false;
   }
 
   /**
@@ -414,13 +542,14 @@ export class ArchiveDiscovery implements vscode.Disposable {
     maxResults: number,
     filesExclude: Record<string, unknown> | undefined,
     token: vscode.CancellationToken,
-    generation: number
+    generation: number,
+    log: (message: string) => void = (m) => this.logger.info(m)
   ): Promise<vscode.Uri[]> {
     const where = describeArchiveId(archiveIdFromUri(root.base), { redactHost: true });
     const method = this.settings.method;
     const searchable = SEARCHABLE_SCHEMES.has(root.base.scheme);
     if (method === 'search' || (method === 'auto' && searchable)) {
-      this.logger.info(`Searching ${where} for "${root.pattern}" with VS Code's search service`);
+      log(`Searching ${where} for "${root.pattern}" with VS Code's search service`);
       const search = Promise.resolve(
         this.host.findFiles(
           new vscode.RelativePattern(root.base, root.pattern),
@@ -448,11 +577,9 @@ export class ArchiveDiscovery implements vscode.Disposable {
         `VS Code's search service did not answer within ${Math.round(this.limits.searchTimeoutMs / 1000)} s; listing folders instead`
       );
     } else if (method === 'auto') {
-      this.logger.info(
-        `No search service for "${root.base.scheme}:" folders; listing folders of ${where} for "${root.pattern}"`
-      );
+      log(`No search service for "${root.base.scheme}:" folders; listing folders of ${where} for "${root.pattern}"`);
     } else {
-      this.logger.info(`Listing folders of ${where} for "${root.pattern}"`);
+      log(`Listing folders of ${where} for "${root.pattern}"`);
     }
 
     const started = Date.now();
@@ -469,7 +596,7 @@ export class ArchiveDiscovery implements vscode.Disposable {
         isCancelled: () => generation !== this.generation || token.isCancellationRequested
       }
     );
-    this.logger.info(
+    log(
       `Listed ${result.foldersListed} folder(s) of ${where} in ${Date.now() - started} ms, ${result.matches.length} match(es)` +
         (result.limit && result.limit !== 'results' ? `; stopped at the ${result.limit} limit` : '') +
         (result.errorCount
@@ -534,6 +661,7 @@ export class ArchiveDiscovery implements vscode.Disposable {
   private stop(): void {
     this.started = false;
     this.generation++;
+    this.clearRescanTimer();
     this.cancel?.cancel();
     this.cancel?.dispose();
     this.cancel = undefined;

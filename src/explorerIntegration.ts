@@ -261,6 +261,9 @@ export function registerExplorerIntegration(
   const discovery = new ArchiveDiscovery(tree, archiveManager, logger);
   discoveryRef.current = discovery;
   context.subscriptions.push(tree, view, discovery);
+  // Automatic rescans wait while the section is hidden
+  discovery.setVisible(view.visible);
+  context.subscriptions.push(view.onDidChangeVisibility((e) => discovery.setVisible(e.visible)));
 
   const updateContext = () =>
     void vscode.commands.executeCommand('setContext', 'archivePeek.hasArchives', tree.allArchives.length > 0);
