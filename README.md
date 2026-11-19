@@ -89,7 +89,8 @@ Read-Only Folder** and **Close Archive**. Refresh and Close are also inline butt
 |--------------------------|---------|-----------------------------------------------------------------------------|
 | `archivePeek.openMode` | `viewer` | How archives open when clicked in the Explorer: `viewer` (editor tab) or `explorerTree` (expandable folder in the Archive Peek section of the Explorer). The other mode stays available from the context menu |
 | `archivePeek.tree.autoDiscover` | `false` | List the archives of the workspace folders in a **Found in Workspace** group of the Archive Peek section (see [Found in Workspace](#found-in-workspace-optional)) |
-| `archivePeek.tree.autoDiscoverInclude` | all supported extensions | Glob of the archives to list, relative to each workspace folder, e.g. `**/reports/**/*.tar.gz` |
+| `archivePeek.tree.autoDiscoverFolders` | `[]` | Folders to search instead of the workspace folders, e.g. `["/tmp/work"]` (absolute paths are on the workspace's host; subfolders included) |
+| `archivePeek.tree.autoDiscoverInclude` | all supported extensions | Glob of the archives to list, relative to each searched folder, e.g. `**/*.tar.gz` |
 | `archivePeek.tree.autoDiscoverExclude` | `**/node_modules/**` | Glob of files and folders not to search; enabled `files.exclude` patterns are always excluded too |
 | `archivePeek.tree.autoDiscoverMaxResults` | `200` | Maximum number of archives listed |
 | `archivePeek.autoRefresh` | `true`  | Reload opened archives (and files opened from them) when they change on disk |
@@ -191,13 +192,29 @@ ARCHIVE PEEK
 - **Bounded**: `archivePeek.tree.autoDiscoverInclude` / `Exclude` restrict the search (the enabled
   `files.exclude` patterns are always excluded), and at most
   `archivePeek.tree.autoDiscoverMaxResults` archives are listed (`200+` means more exist).
+- **Where it searches**: the workspace folders, or the folders in
+  `archivePeek.tree.autoDiscoverFolders` (absolute paths on the workspace's host, also outside the
+  workspace; subfolders included). A pattern is only a filter, so the search service walks the whole
+  folder it starts in. A literal leading path in the include pattern
+  (`tmp/work/**/*.tar.gz`) is therefore turned into the start folder, and a search
+  that starts at `/` skips `/proc`, `/sys`, `/dev` and `/run`.
 - Found archives show their folder relative to the workspace. **Close Archive** hides one until the
   next **Rescan**. Opening one explicitly moves it to the top of the section.
 - Folders mounted from archives (`archive://`) are not searched. The setting is changed in the
   *user* settings, never in the workspace's `.vscode/settings.json`, which may be on the remote host.
 
-On a very large remote workspace the first search can take a few seconds; narrow
-`autoDiscoverInclude` (e.g. `**/reports/**/*.tar.gz`) if needed.
+**Example**: a Remote SSH window with `/` open, archives only under `/tmp/work`
+(and its subfolders), at most 100:
+
+```json
+"archivePeek.tree.autoDiscover": true,
+"archivePeek.tree.autoDiscoverFolders": ["/tmp/work"],
+"archivePeek.tree.autoDiscoverInclude": "**/*.{tar.gz,tgz,tar,tar.xz,txz,tar.bz2,tbz2,gz,zip}",
+"archivePeek.tree.autoDiscoverMaxResults": 100
+```
+
+Without `autoDiscoverFolders`, a workspace opened at `/` is searched as a whole (minus the pseudo
+file systems), which can take long on a full operating system.
 
 ### Performance
 
@@ -369,11 +386,11 @@ possible but need correspondingly more free RAM during the transfer.
 The VSIX is built into `dist/`. Install it **into the local VS Code only** — never into the remote:
 
 ```bash
-code --install-extension dist/archive-peek-remote-0.3.0.vsix --force
+code --install-extension dist/archive-peek-remote-0.3.1.vsix --force
 ```
 
 (or Extensions view → `…` → **Install from VSIX…**, *in a local window*), then run
-**Developer: Reload Window**. 0.3.0 installs over 0.1.x / 0.2.x (same identifier
+**Developer: Reload Window**. 0.3.1 installs over 0.1.x – 0.3.0 (same identifier
 `local.archive-peek-remote`); settings and everything else carry over. Because of
 `extensionKind: ["ui"]`, VS Code runs it locally in Remote SSH windows; it does not offer to
 install it "in SSH: host" and you should not use **Install in SSH**.

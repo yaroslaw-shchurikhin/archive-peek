@@ -2,7 +2,7 @@
   "name": "archive-peek-remote",
   "displayName": "Archive Peek (Remote SSH)",
   "description": "Peek inside .zip, .7z, .rar, .tar, .gz, .bz2, .xz, .tar.gz, .tar.bz2, .tar.xz, .jar, .war, .vsix, .nupkg, .apk, .whl, .xpi, .epub, .aar archives without extracting them, in a viewer or as expandable folders in the Explorer. Works with archives on Remote SSH hosts without installing anything on the server.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "local",
   "repository": "https://github.com/Dzuelu/archive-peek",
   "engines": {
@@ -64,10 +64,18 @@
           "default": false,
           "markdownDescription": "List the archives found in the workspace folders in a **Found in Workspace** group of the Archive Peek section. The search runs once (when the section is shown) through VS Code's search service — on a Remote SSH host, the VS Code Server's own search; nothing is installed — and a file watcher keeps the list current. Archives are only listed; each one is read when you expand it."
         },
+        "archivePeek.tree.autoDiscoverFolders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Folders to search instead of the workspace folders, e.g. `[\"/tmp/work\"]`. Absolute paths are on the host of the workspace (the Remote SSH host in a remote window); relative paths are resolved against each workspace folder. Subfolders are always included. Use this when the workspace is a large folder such as `/`."
+        },
         "archivePeek.tree.autoDiscoverInclude": {
           "type": "string",
           "default": "**/*.{zip,7z,rar,tar,gz,tgz,bz2,tbz2,xz,txz,jar,war,ear,vsix,nupkg,apk,whl,xpi,epub,aar}",
-          "markdownDescription": "Glob pattern (relative to each workspace folder) of the archives to list, e.g. `**/reports/**/*.tar.gz`."
+          "markdownDescription": "Glob pattern of the archives to list, relative to each searched folder (`#archivePeek.tree.autoDiscoverFolders#`, or the workspace folders), e.g. `**/*.tar.gz`. A leading literal path such as `tmp/work/**/*.tar.gz` makes the search start in that folder."
         },
         "archivePeek.tree.autoDiscoverExclude": {
           "type": "string",

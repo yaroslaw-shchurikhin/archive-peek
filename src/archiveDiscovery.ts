@@ -42,6 +42,8 @@ export interface DiscoverySettings {
   include: string;
   exclude: string;
   maxResults: number;
+  /** Folders to search instead of the workspace folders (absolute on the workspace's host, or relative to each workspace folder) */
+  folders: string[];
 }
 
 export function readDiscoverySettings(): DiscoverySettings {
@@ -49,6 +51,7 @@ export function readDiscoverySettings(): DiscoverySettings {
   const include = config.get<string>('autoDiscoverInclude', DEFAULT_INCLUDE);
   const exclude = config.get<string>('autoDiscoverExclude', DEFAULT_EXCLUDE);
   const max = config.get<number>('autoDiscoverMaxResults', DEFAULT_MAX_RESULTS);
+  const folders = config.get<unknown>('autoDiscoverFolders', []);
   return {
     enabled: config.get<boolean>('autoDiscover', false) === true,
     include: typeof include === 'string' && include.trim() ? include.trim() : DEFAULT_INCLUDE,
@@ -56,8 +59,88 @@ export function readDiscoverySettings(): DiscoverySettings {
     maxResults:
       typeof max === 'number' && Number.isFinite(max) && max > 0
         ? Math.min(Math.floor(max), 10_000)
-        : DEFAULT_MAX_RESULTS
+        : DEFAULT_MAX_RESULTS,
+    folders: Array.isArray(folders)
+      ? folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '').map((f) => f.trim())
+      : []
   };
+}
+
+/** Where one findFiles query runs. */
+export interface SearchRoot {
+  /** Folder the search starts in */
+  base: vscode.Uri;
+  /** Glob relative to `base` */
+  pattern: string;
+  /** Extra excludes for this root (pseudo file systems when searching from `/`) */
+  extraExclude?: readonly string[];
+}
+
+/** Linux pseudo file systems that must not be walked when searching from `/`. */
+export const ROOT_PSEUDO_EXCLUDE: readonly string[] = ['proc/**', 'sys/**', 'dev/**', 'run/**'];
+
+const GLOB_CHARS = /[*?[\]{}]/;
+
+function isAbsolutePath(p: string): boolean {
+  return p.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(p);
+}
+
+/**
+ * The folders to search and the pattern for each.
+ *
+ * - `archivePeek.tree.autoDiscoverFolders` replaces the workspace folders:
+ *   absolute paths are on the host of the (first) workspace folder — the
+ *   Remote SSH host in a remote window — and relative paths are resolved
+ *   against every workspace folder.
+ * - A literal leading part of the include pattern (`tmp/work/**\/*.tgz`)
+ *   becomes part of the search folder, so the search service walks only that
+ *   subtree instead of the whole folder and filtering afterwards.
+ * - Searching from `/` skips /proc, /sys, /dev and /run.
+ */
+export function computeSearchRoots(
+  workspaceFolders: readonly { uri: vscode.Uri }[],
+  settings: Pick<DiscoverySettings, 'include' | 'folders'>
+): SearchRoot[] {
+  const folders = workspaceFolders.filter((f) => f.uri.scheme !== ARCHIVE_SCHEME);
+  let bases: vscode.Uri[];
+  if (settings.folders.length > 0) {
+    bases = [];
+    for (const folder of settings.folders) {
+      if (isAbsolutePath(folder)) {
+        const host = folders[0]?.uri;
+        if (!host || host.scheme === 'file') {
+          bases.push(vscode.Uri.file(folder));
+        } else {
+          const posix = folder.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+          bases.push(host.with({ path: posix, query: '', fragment: '' }));
+        }
+      } else {
+        for (const f of folders) {
+          bases.push(vscode.Uri.joinPath(f.uri, folder));
+        }
+      }
+    }
+  } else {
+    bases = folders.map((f) => f.uri);
+  }
+
+  // Move the literal leading segments of the pattern into the base folder
+  const segments = settings.include.replace(/^\.\//, '').split('/');
+  const firstGlob = segments.findIndex((segment) => GLOB_CHARS.test(segment));
+  const literal = firstGlob > 0 ? segments.slice(0, firstGlob) : [];
+  const pattern = literal.length > 0 ? segments.slice(firstGlob).join('/') : settings.include;
+
+  const roots = new Map<string, SearchRoot>();
+  for (const base of bases) {
+    const root = literal.length > 0 ? vscode.Uri.joinPath(base, ...literal) : base;
+    roots.set(root.toString(), {
+      base: root,
+      pattern,
+      // Unix file system root: don't walk pseudo file systems (harmless where they don't exist)
+      extraExclude: root.path === '/' ? ROOT_PSEUDO_EXCLUDE : undefined
+    });
+  }
+  return [...roots.values()];
 }
 
 /**
@@ -67,11 +150,15 @@ export function readDiscoverySettings(): DiscoverySettings {
  */
 export function buildExcludePattern(
   exclude: string,
-  filesExclude: Record<string, unknown> | undefined
+  filesExclude: Record<string, unknown> | undefined,
+  extra: readonly string[] = []
 ): string | undefined {
   const patterns = new Set<string>();
   if (exclude) {
     patterns.add(exclude);
+  }
+  for (const pattern of extra) {
+    patterns.add(pattern);
   }
   for (const [pattern, value] of Object.entries(filesExclude ?? {})) {
     // Only plain `true` entries; `{ when: … }` conditions can't be expressed in one glob
@@ -197,24 +284,25 @@ export class ArchiveDiscovery implements vscode.Disposable {
     this.cancel = cancel;
     this.disposeWatchers();
 
-    const { include, maxResults } = this.settings;
-    const exclude = buildExcludePattern(this.settings.exclude, this.filesExclude());
-    const folders = this.host.workspaceFolders().filter((f) => f.uri.scheme !== ARCHIVE_SCHEME);
+    const { maxResults } = this.settings;
+    const filesExclude = this.filesExclude();
+    const roots = computeSearchRoots(this.host.workspaceFolders(), this.settings);
     this.tree.setScanning(true);
     const started = Date.now();
     const found: string[] = [];
     let truncated = false;
     try {
-      for (const folder of folders) {
+      for (const root of roots) {
         const remaining = maxResults - found.length;
         if (remaining <= 0) {
           truncated = true;
           break;
         }
+        const rootExclude = buildExcludePattern(this.settings.exclude, filesExclude, root.extraExclude);
         // One more than needed tells whether the list is cut off
         const uris = await this.host.findFiles(
-          new vscode.RelativePattern(folder, include),
-          exclude,
+          new vscode.RelativePattern(root.base, root.pattern),
+          rootExclude,
           remaining + 1,
           cancel.token
         );
@@ -238,22 +326,23 @@ export class ArchiveDiscovery implements vscode.Disposable {
     }
 
     this.logger.info(
-      `Found ${found.length}${truncated ? '+' : ''} archive(s) in ${folders.length} workspace folder(s) in ${Date.now() - started} ms`
+      `Found ${found.length}${truncated ? '+' : ''} archive(s) in ${roots.length} folder(s) in ${Date.now() - started} ms` +
+        ` (${roots.map((r) => describeArchiveId(archiveIdFromUri(r.base), { redactHost: true })).join(', ')})`
     );
     this.tree.setDiscovered(found, { truncated, resetHidden: options.resetHidden });
-    this.watch(folders);
+    this.watch(roots);
   }
 
   /** Keep the list current from file events instead of searching again. */
-  private watch(folders: readonly vscode.WorkspaceFolder[]): void {
+  private watch(roots: readonly SearchRoot[]): void {
     this.disposeWatchers();
-    for (const folder of folders) {
-      const watcher = this.host.createWatcher(new vscode.RelativePattern(folder, this.settings.include));
+    for (const root of roots) {
+      const watcher = this.host.createWatcher(new vscode.RelativePattern(root.base, root.pattern));
       this.watchers.push(
         watcher,
         watcher.onDidCreate((uri) => {
           const id = archiveIdFromUri(uri);
-          if (this.archiveManager.isSupported(id) && !this.isExcluded(uri, folder)) {
+          if (this.archiveManager.isSupported(id) && !this.isExcluded(uri, root.base)) {
             this.logger.info(`New archive in the workspace: ${describeArchiveId(id, { redactHost: true })}`);
             this.tree.addDiscovered(id);
           }
@@ -270,10 +359,9 @@ export class ArchiveDiscovery implements vscode.Disposable {
   }
 
   /** Apply the exclude setting to watcher events (the watcher only matches the include pattern). */
-  private isExcluded(uri: vscode.Uri, folder: vscode.WorkspaceFolder): boolean {
-    const relative = uri.path.startsWith(folder.uri.path.replace(/\/$/, '') + '/')
-      ? uri.path.slice(folder.uri.path.replace(/\/$/, '').length + 1)
-      : uri.path;
+  private isExcluded(uri: vscode.Uri, base: vscode.Uri): boolean {
+    const basePath = base.path.replace(/\/$/, '');
+    const relative = uri.path.startsWith(basePath + '/') ? uri.path.slice(basePath.length + 1) : uri.path;
     const exclude = this.settings.exclude;
     // Common case: "**/<dir>/**"
     const dirMatch = /^\*\*\/([^*{}/]+)\/\*\*$/.exec(exclude);

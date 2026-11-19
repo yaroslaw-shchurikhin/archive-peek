@@ -27,6 +27,7 @@ import {
 import {
   ArchiveDiscovery,
   buildExcludePattern,
+  computeSearchRoots,
   DEFAULT_INCLUDE,
   readDiscoverySettings,
   workspaceRelativeLocation
@@ -50,7 +51,8 @@ describe('discovery settings', () => {
       enabled: false,
       include: DEFAULT_INCLUDE,
       exclude: '**/node_modules/**',
-      maxResults: 200
+      maxResults: 200,
+      folders: []
     });
     expect(DEFAULT_INCLUDE).toContain('gz');
     expect(DEFAULT_INCLUDE).toContain('tgz');
@@ -65,6 +67,51 @@ describe('discovery settings', () => {
     expect(settings.enabled).toBe(true);
     expect(settings.include).toBe(DEFAULT_INCLUDE);
     expect(settings.maxResults).toBe(200);
+  });
+
+  it('starts the search in the literal leading folder of the include pattern', () => {
+    const root = [{ uri: URI.from({ scheme: 'vscode-remote', authority: 'ssh-remote+Host-A', path: '/' }) }];
+    const [r] = computeSearchRoots(root as never, {
+      include: 'tmp/work/**/*.{tar.gz,zip}',
+      folders: []
+    });
+    expect(r.base.path).toBe('/tmp/work');
+    expect(r.base.authority).toBe('ssh-remote+Host-A');
+    expect(r.pattern).toBe('**/*.{tar.gz,zip}');
+    expect(r.extraExclude).toBeUndefined();
+  });
+
+  it('skips /proc, /sys, /dev and /run when searching from the file system root', () => {
+    const root = [{ uri: URI.from({ scheme: 'vscode-remote', authority: 'ssh-remote+h', path: '/' }) }];
+    const [r] = computeSearchRoots(root as never, { include: DEFAULT_INCLUDE, folders: [] });
+    expect(r.base.path).toBe('/');
+    expect(r.pattern).toBe(DEFAULT_INCLUDE);
+    expect(r.extraExclude).toEqual(['proc/**', 'sys/**', 'dev/**', 'run/**']);
+    expect(buildExcludePattern('**/node_modules/**', { '**/.git': true }, r.extraExclude)).toBe(
+      '{**/node_modules/**,proc/**,sys/**,dev/**,run/**,**/.git}'
+    );
+  });
+
+  it('searches the configured folders instead of the workspace folders', () => {
+    const remote = URI.from({ scheme: 'acme-sftp', authority: 'Host-A', path: '/' });
+    const folders = [{ uri: remote }, { uri: URI.from({ scheme: 'archive', authority: 'ab', path: '/x.zip' }) }];
+    const roots = computeSearchRoots(folders as never, {
+      include: DEFAULT_INCLUDE,
+      folders: ['/tmp/work', '/tmp/work/', 'var/reports']
+    });
+    expect(roots.map((r) => `${r.base.scheme}://${r.base.authority}${r.base.path}`)).toEqual([
+      'acme-sftp://Host-A/tmp/work',
+      'acme-sftp://Host-A/var/reports'
+    ]);
+
+    const local = computeSearchRoots([], { include: '**/*.zip', folders: ['/tmp/builds'] });
+    expect(local.map((r) => r.base.toString())).toEqual(['file:///tmp/builds']);
+
+    const multi = computeSearchRoots([{ uri: URI.file('/w/a') }, { uri: URI.file('/w/b') }] as never, {
+      include: '**/*.zip',
+      folders: ['reports']
+    });
+    expect(multi.map((r) => r.base.path)).toEqual(['/w/a/reports', '/w/b/reports']);
   });
 
   it('merges files.exclude into the exclude pattern', () => {
@@ -194,6 +241,22 @@ describe('Found in Workspace (archivePeek.tree.autoDiscover)', () => {
     expect(groupItem.collapsibleState).toBe(TreeItemCollapsibleState.Expanded);
     expect(groupItem.contextValue).toBe('archivePeek.discoveredGroup');
     expect(tree.allArchives).toHaveLength(3);
+  });
+
+  it('searches only the configured folder on the remote host, e.g. /tmp/work', async () => {
+    configuration['archivePeek.tree.autoDiscoverFolders'] = ['/srv/project/reports'];
+    configuration['archivePeek.tree.autoDiscoverMaxResults'] = 100;
+    discovery.applySettings(readDiscoverySettings());
+    workspaceState.findFiles = async (include) => {
+      const base = (include as RelativePattern).baseUri.path;
+      return searchResults.filter((p) => p.startsWith(base + '/')).map((p) => provider.uri(p));
+    };
+    await showTree();
+    const call = workspaceState.findFilesCalls.at(-1)!;
+    expect((call.include as RelativePattern).baseUri.toString()).toBe(provider.uri('/srv/project/reports').toString());
+    expect(call.maxResults).toBe(101);
+    expect((await groupChildren()).map(label)).toEqual(['post_check.tar.gz', 'pre_check.tar.gz']);
+    expect(createdWatchers.at(-1)?.pattern.baseUri.path).toBe('/srv/project/reports');
   });
 
   it('loads a found archive only when it is expanded', async () => {
